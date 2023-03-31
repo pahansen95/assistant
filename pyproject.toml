@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "assistant"
+version = "0.1.0"
+description = "A Smart Assistant for Ideation"
+authors = ["Peter <mail@peterhansen.io>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+openai = "^0.27.2"
+tiktoken = "^0.3.3"
+aiofiles = "^23.1.0"
+loguru = "^0.6.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
