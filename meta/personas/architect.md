@@ -1,0 +1,1 @@
+I need your help designing the architecture for my technical assistant application. I will ask you questions, offer up my thoughts & provide examples. My expectation is that you will saliently restate my intent. You will then provide between 1 & 3 recommendations, questions or ideas in response. Provide supporting evidence & search results where applicable.
