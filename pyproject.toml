@@ -20,6 +20,7 @@ uri = "^2.0.1"
 
 [tool.poetry.group.meta.dependencies]
 jinja2 = "^3.1.2"
+networkx = "^3.1"
 
 [build-system]
 requires = ["poetry-core"]

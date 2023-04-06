@@ -74,8 +74,8 @@ import openai
 import tiktoken
 import os
 import sys
-from typing import NamedTuple, Iterable, Callable, Any
-from dataclasses import dataclass
+from typing import Iterable, Callable, Any, TypeVar, AsyncGenerator, AsyncIterable
+from dataclasses import dataclass, field
 import pathlib
 import enum
 import functools
@@ -84,6 +84,88 @@ import asyncio
 import itertools
 import re
 import datetime
+import uuid
+import networkx as nx
+import time
+
+T = TypeVar("T")
+
+ANDROGYNOUS_NAMES: tuple[str] = (
+  "Alex",
+  "Avery",
+  "Bailey",
+  "Blair",
+  "Bobby",
+  "Brett",
+  "Brook",
+  "Cameron",
+  "Campbell",
+  "Casey",
+  "Charlie",
+  "Chris",
+  "Dakota",
+  "Dana",
+  "Drew",
+  "Eli",
+  "Elliot",
+  "Emerson",
+  "Finley",
+  "Frankie",
+  "Gale",
+  "Harley",
+  "Hayden",
+  "Hunter",
+  "Jackie",
+  "Jamie",
+  "Jay",
+  "Jesse",
+  "Jordan",
+  "Jules",
+  "Kai",
+  "Kendall",
+  "Kerry",
+  "Kim",
+  "Kris",
+  "Kyle",
+  "Lee",
+  "Logan",
+  "London",
+  "Mackenzie",
+  "Madison",
+  "Max",
+  "Morgan",
+  "Nicky",
+  "Noah",
+  "Parker",
+  "Pat",
+  "Peyton",
+  "Phoenix",
+  "Quinn",
+  "Randy",
+  "Reagan",
+  "Reese",
+  "Riley",
+  "River",
+  "Robin",
+  "Rowan",
+  "Ryan",
+  "Sage",
+  "Sam",
+  "Sandy",
+  "Sawyer",
+  "Shawn",
+  "Sidney",
+  "Sky",
+  "Spencer",
+  "Stevie",
+  "Terry",
+  "Taylor",
+  "Toni",
+  "Tyler",
+  "Val",
+  "Whitney",
+  "Wren"
+)
 
 model_lookup = {
   "gpt3": {
@@ -120,7 +202,7 @@ model_lookup = {
 
 persona_templates = {
   "sme": """\
-Take on the persona of a Subject Matter Expert (SME).
+You are a Subject Matter Expert (SME).
 
 An SME is...
 1. An individual with extensive knowledge in a specific domain or field.
@@ -134,30 +216,327 @@ An SME is responsible for...
 3. Producing content such as articles, books, white papers, or other publications.
 4. Ensuring work aligns with industry standards and best practices through quality assurance processes.
 
-The particulars of your role as an SME are described below.
+The particulars of your role as an SME are described below:
 > {sme_description}
 """
 }
 
 string_alnum_lower = lambda s: re.sub(r"[^a-zA-Z0-9]", "", s).lower()
 
+_sme_id = tuple[str, ...]
+"""The Identification Key of an SME."""
+
+openapi_concurrent_requests_lock: asyncio.Semaphore
+"""Ensures that only a set number of concurrent requests are made to the OpenAI API at any one time."""
+total_token_count: int = 0
+
+@dataclass
+class Entity:
+  """A Contributor to a Conversation. key & persona are optional & don't contribute the entity's identity."""
+  uuid: uuid.UUID
+  """The UUID of the entity."""
+  name: str
+  """The name of the entity."""
+  key: tuple[str, ...] | None = None
+  """An optional set of strings that uniquely describe the entity's persona"""
+  persona: str | None = None
+  """The optional persona of the entity. Who is this entity, what are their capabilities, etc..."""
+  context: list[str] = field(default_factory=list)
+  """Any contextal information that the entity should track; this is akin to short term memory."""
+
+  def __hash__(self) -> int:
+    return hash((self.uuid.hex, self.name))
+  
+  def render_context(self) -> str:
+    return "# You remember the following\n{context}".format(
+      context="\n".join(f"- {c}" for c in self.context)
+    )
+  
+  async def respond(
+    self,
+    chat: Iterable[str],
+    context: Iterable[str],
+    model: str,
+    responding_personality: str,
+    reflection_personality: str,
+  ) -> str:
+    """The entity responds as part of a conversation. The latest message in the conversation is the last item in the chat list.
+    The Entity knows the following:
+    - Entity's name
+    - Entity's persona
+    - Entity's Short Term Memory (ie. `entity.context`)
+    - Environmental Context (in order provided) (`context` arbitrary textual data to be used as context)
+    - Chat Transcript (in order provided) (`chat` should be ordered with the oldest message first)
+    """
+    _user_msg = functools.partial(
+      ChatMessage,
+      entity=self,
+      role=CHAT_ROLE.USER,
+    )
+    # Entity will come up with a response
+    initial_response = await _parse_and_retry_chat(
+      messages=[
+        _user_msg(content=f"Your name is {self.name}"),
+        _user_msg(content=f"# This is your persona\n{self.persona}"),
+        _user_msg(content=self.render_context()),
+        _user_msg(content="# Here are observations you have made\n{context}".format(context='\n'.join(f'- {c}' for c in context))),
+        _user_msg(content="# Here is the conversation so far\n"),
+        *[
+          _user_msg(content=c)
+          for c in chat
+        ],
+      ],
+      model=model,
+      personality=responding_personality,
+      max_retry_count=3,
+    )
+    logger.trace(f"Entities {self.name} initial response: {initial_response}")
+    # Let the entity think about it's response
+    # reflective_thought = "Here is the conversation you are replying to:\n{conversation}You want to respond with: {response}. How could you improve your response? ".format(
+    #   response=initial_response,
+    #   conversation='\n'.join(f'- {c}' for c in chat),
+    # )
+    reflective_thought = "How can you improve the content quality of your response\n>{response} to\n> {chat}".format(
+      response=initial_response,
+      chat=chat[-1],
+    )
+    reflection = await self.think(
+      thought=reflective_thought,
+      # context=context,
+      context=[],
+      model=model,
+      thinking_personality=reflection_personality,
+      summary_personality=responding_personality,
+    )
+    logger.trace(f"Entities {self.name} reflection on it's thought: {reflection}")
+    # Generate another response incorporating the reflection
+    revised_response = await _parse_and_retry_chat(
+      messages=[
+        _user_msg(content=f"# This is your persona\n{self.persona}"),
+        _user_msg(content="\n".join([
+          "Without being verbose, improve the content quality of your response by applying the provided ideas",
+          "# Here is the conversation you are replying to:",
+          chat[-1],
+          "# You want to respond with:",
+          initial_response,
+          "# You can improve your response by applying these ideas:",
+          reflection,
+        ])),
+        # _user_msg(content=f"Without being verbose, improve the content quality of your response by applying the provided ideas\n> {initial_response}\nto\n> {chat}\nby applying these ideas:\n> {reflection}"),
+        # _user_msg(content=f"Your name is {self.name}"),
+        # _user_msg(content=f"# This is your persona\n{self.persona}"),
+        # _user_msg(content=self.render_context()),
+        # _user_msg(content="# You thought about how to respond & concluded:\n{reflection}".format(reflection=reflection)),
+        # _user_msg(content="# Here are observations you have made:\n{context}".format(context='\n'.join(f'- {c}' for c in context))),
+        # _user_msg(content="# Here is the conversation so far..."),
+        # *[
+        #   _user_msg(content=c)
+        #   for c in chat
+        # ],
+      ],
+      model=model,
+      personality=responding_personality,
+      max_retry_count=3,
+    )
+    logger.trace(f"Entities {self.name} revised response: {revised_response}")
+    # TODO: Add Heuristics to determine if the response is any good
+    return revised_response
+  
+  async def think(
+    self,
+    thought: str,
+    context: Iterable[str],
+    model: str,
+    thinking_personality: str,
+    summary_personality: str,
+  ) -> str:
+    """The entity reflects on a thought.
+    The Entity references the following:
+      - It's internal context (ie. `entity.context`)
+      - Environmental Context (in order provided) (`context` arbitrary textual data to be used as context)
+      - The thought to reflect on (`thought`)
+    """
+    _user_msg = functools.partial(
+      ChatMessage,
+      entity=self,
+      role=CHAT_ROLE.USER,
+    )
+    _assistant_msg = functools.partial(
+      ChatMessage,
+      entity=self,
+      role=CHAT_ROLE.ASSISTANT,
+    )
+    # generate an initial thought
+    logger.trace(f"Entity: {self.name} is thinking about: {thought}")
+    initial_thought = await _parse_and_retry_chat(
+      messages=[
+        _user_msg(content=f"# This is your persona\n{self.persona}"),
+        _user_msg(content=self.render_context()),
+        _user_msg(content="# Here are observations you have made\n{context}".format(context='\n'.join(context))),
+        _user_msg(content=f"# Contemplate the following, summarize your thoughts & walk me through it step by step\n{thought}"),
+      ],
+      model=model,
+      personality=thinking_personality,
+    )
+    logger.trace(f"Entity {self.name} is reflecting on it's thought: {initial_thought}")
+    # reflect on the initial thought
+    reflection = await _parse_and_retry_chat(
+      messages=[
+        _user_msg(content=f"# This is your persona\n{self.persona}"),
+        _user_msg(content=self.render_context()),
+        _user_msg(content="Here are observations you have made: {context}".format(context='\n'.join(context))),
+        _user_msg(content=f"Contemplate the following, summarize your thoughts & walk me through it step by step: {thought}"),
+        _assistant_msg(content=initial_thought),
+        _user_msg(content=f"Very intriguing. In your opinion, what is most relevant or most impactful? Why?"),
+      ],
+      model=model,
+      personality=thinking_personality,
+    )
+    logger.trace(f"Entity {self.name} is summarizing it's reflection: {reflection}")
+    # Generate a salient description of the thought
+    summary = await _parse_and_retry_chat(
+      messages=[
+        # _user_msg(content=f"# This is your persona\n{self.persona}"),
+        # _user_msg(content=self.render_context()),
+        # _user_msg(content="Here are observations you have made: {context}".format(context='\n'.join(context))),
+        _assistant_msg(content=initial_thought),
+        _assistant_msg(content=reflection),
+        _user_msg(content="Produce a salient summary as an itemized list of ONLY three points that are concise & succinct"),
+      ],
+      model=model,
+      personality=summary_personality,
+    )
+    logger.trace(f"Entity {self.name} summarized it's thought as: {summary}")
+    return summary
+
+  def to_dict(self):
+    return {
+      "id": self.id.hex,
+      "name": self.name,
+      "key": list(self.key) if self.key is not None else None,
+      "persona": self.persona if self.persona is not None else None,
+      "context": self.context,
+    }
+
+  @classmethod
+  def from_dict(cls, d: dict[str, Any]):
+    return cls(
+      id=uuid.UUID(d["id"]),
+      name=d["name"],
+      key=tuple(d["key"]) if d["key"] is not None else None,
+      persona=d["persona"] if d["persona"] is not None else None,
+      context=d["context"],
+    )
+
+async def reduce_thoughts(
+  entity: Entity,
+  thoughts: Iterable[str],
+  context: Iterable[str],
+  model: str,
+  thinking_personality: str,
+  summary_personality: str,
+) -> str:
+  """Reduces a set of thoughts into a single salient summary.
+  Currently, this is niave implementation that produces salient summaries for each thought & then concatenates them.
+  There is a TODO to use embeddings to group thoughts first before further reduction."""
+  entity_thoughts = list(thoughts)
+  assert len(entity_thoughts) > 0, f"Cannot reduce 0 thoughts (entity: {entity.name})"
+  initial_thoughts = await asyncio.gather(*[
+    entity.think(
+      thought=thought,
+      context=context,
+      model=model,
+      thinking_personality=thinking_personality,
+      summary_personality=summary_personality,
+    )
+    for thought in entity_thoughts
+  ])
+  reduced_thought = await entity.think(
+    thought="\n".join(initial_thoughts),
+    context=context,
+    model=model,
+    thinking_personality=thinking_personality,
+    summary_personality=summary_personality,
+  )
+  return reduced_thought
+
 class CHAT_ROLE(enum.Enum):
   SYSTEM: str = "system"
   USER: str = "user"
   ASSISTANT: str = "assistant"
 
-class ChatMessage(NamedTuple):
-  """Represents a chat message."""
+@dataclass
+class ChatMessage:
+  """Represents a chat message. A message's identity is determined by its speaking entity & content."""
+  entity: Entity
+  """The posting Entity."""
   role: CHAT_ROLE
+  """The role expected by the OpenAI API"""
   content: str
+  """The actual content of the message."""
+
+  def __hash__(self) -> int:
+    return hash((self.entity, self.content))
 
   def to_dict(self):
     return {
+      "entity": self.entity.uuid.hex,
       "role": self.role.value,
       "content": self.content,
     }
 
-def count_tokens(model: str, *messages: ChatMessage):
+  @classmethod
+  def from_dict(cls, d: dict[str, Any]):
+    return cls(
+      entity=uuid.UUID(d["entity"]),
+      role=CHAT_ROLE(d["role"]),
+      content=d["content"],
+    )
+
+@dataclass
+class ChatTranscript:
+  """Log Chat Messages & record the conversation flow."""
+  conversation: nx.DiGraph = field(default_factory=nx.DiGraph)
+  """Relational data between speakers, message & conversation flow."""
+  entities: set[Entity] = field(default_factory=set)
+  """All the entities in the chat."""
+  messages: list[ChatMessage] = field(default_factory=list)
+  """The underlying messages of the chat."""
+
+  def __post_init__(self):
+    self.conversation.add_node("root", role=CHAT_ROLE.SYSTEM)
+  
+  def entity_said(
+    self,
+    entity: Entity,
+    said: str,
+    in_response_to: Iterable[ChatMessage] | ChatMessage | None = None,
+  ) -> ChatMessage:
+    """Records a message from an entity updating the conversational Graph. Returns the message."""
+    # create a new message
+    message = ChatMessage(
+      entity=entity,
+      role=CHAT_ROLE.USER if entity.persona is None else CHAT_ROLE.ASSISTANT,
+      content=said,
+    )
+    # Add the entity to the transcript's set of entities
+    self.entities.add(entity)
+    # Add the message to the transcript's list of messages
+    self.messages.append(message)
+    # Add the message to the conversation graph
+    self.conversation.add_node(message, role=message.role)
+    # Update the conversation graph to reflect the message's relationship to other messages
+    if in_response_to is not None:
+      if isinstance(in_response_to, ChatMessage):
+        in_response_to = [in_response_to]
+      for response in in_response_to:
+        self.conversation.add_edge(message, response)
+    else:
+      self.conversation.add_edge(message, "root")
+
+    return message
+  
+def count_tokens(model: str, *messages: str | ChatMessage):
   """Returns the number of tokens used in a prompt."""
   try:
     encoding = tiktoken.encoding_for_model(model)
@@ -166,50 +545,152 @@ def count_tokens(model: str, *messages: ChatMessage):
     encoding = tiktoken.get_encoding("cl100k_base")
   
   return len(encoding.encode(
-    "\n".join(map(lambda m: m.content, messages))
+    "\n".join(
+      msg if isinstance(msg, str) else msg.content
+      for msg in messages
+    )
   ))
 
+class _StreamStopped(Exception):
+  """Raised when the stream is stopped."""
+  def __init__(self, reason: str):
+    self.reason = reason
+
+async def _yield_chunks(
+  streaming_response: AsyncIterable[dict],
+  chunk_recieved: asyncio.Event,
+) -> AsyncGenerator[str, None]:
+  async for chunk in streaming_response:
+    # Get the reply from the response
+    # TODO: Support multiple choices
+    if chunk["choices"][0]["delta"] != {}:
+      if "content" in chunk["choices"][0]["delta"]:
+        if chunk["choices"][0]["delta"]["content"]:
+          chunk_recieved.set()
+          yield chunk["choices"][0]["delta"]["content"]
+        continue # Skip to the next chunk if there is no content
+      elif "role" in chunk["choices"][0]["delta"]:
+        continue # Skip to the next chunk
+    # Check if the model finished it's reply
+    if chunk["choices"][0]["finish_reason"] == None:
+      continue
+    else:
+      raise _StreamStopped(chunk['choices'][0]['finish_reason'])
+
+async def _gather_response(
+  streaming_response: AsyncIterable[dict],
+  chunk_recieved: asyncio.Event,
+  stream_complete: asyncio.Event,
+) -> tuple[str, str]:
+  response = ""
+  try:
+    async for chunk in _yield_chunks(streaming_response, chunk_recieved):
+      response += chunk
+      chunk_recieved.clear()
+  except _StreamStopped as stop_reason:
+    # Make sure the watchdog doesn't timeout
+    stream_complete.set()
+    chunk_recieved.set()
+    return response, stop_reason.reason
+
+async def _streaming_watchdog(
+  timeout: float,
+  chunk_recieved: asyncio.Event,
+  stream_complete: asyncio.Event,
+) -> None:
+  """Waits for a chunk to be recieved before timing out."""
+  try:
+    while not stream_complete.is_set():
+      await asyncio.wait_for(chunk_recieved.wait(), timeout)
+  except asyncio.TimeoutError:
+    raise asyncio.TimeoutError("OpenAI Streaming API timed out.")
+
+async def safe_openai_request(
+  chunk_timeout: float,
+  max_retries: int,
+  **acreate_kwargs,
+) -> tuple[str, str]:
+  """Uses the streaming protocol w/ openAI to avoid hanging requests."""
+  global total_token_count
+  prompt_tokens = count_tokens(acreate_kwargs["model"], *[msg["content"] for msg in acreate_kwargs["messages"]])
+  acreate_kwargs.pop("stream", None)
+  retry_count = 0
+  while retry_count < max_retries:
+    global openapi_concurrent_requests_lock
+    async with openapi_concurrent_requests_lock:
+      streaming_response = await openai.ChatCompletion.acreate(
+        stream=True,
+        **acreate_kwargs,
+      )
+      total_token_count += prompt_tokens
+      chunk_recieved = asyncio.Event()
+      stream_complete = asyncio.Event()
+      try:
+        results = await asyncio.gather(
+          _gather_response(streaming_response, chunk_recieved, stream_complete),
+          _streaming_watchdog(chunk_timeout, chunk_recieved, stream_complete),
+        )
+        total_token_count += count_tokens(acreate_kwargs["model"], results[0][0])
+        return results[0]
+      except asyncio.TimeoutError:
+        logger.warning("OpenAI Streaming API timed out. Retrying...")
+        retry_count += 1
+        continue
 
 async def chat(
-  persona: ChatMessage,
   messages: Iterable[ChatMessage],
   model: str,
   personality: dict,
-) -> ChatMessage:
+) -> str:
   """Submits a chat for completion to the OpenAI Chat API."""
-  logger.trace("Submitting chat to OpenAI...")
-  try:
-    response = await openai.ChatCompletion.acreate(
-      model=model,
-      messages=[
-        persona.to_dict(),
-        *map(lambda m: m.to_dict(), messages),
-      ],
-      stream=False,
-      temperature=personality["tuning"]["temperature"],
-      top_p=personality["tuning"]["top_p"],
-    )
-    logger.trace("Response received.")
-    if response["choices"][0]["finish_reason"] != "stop":
-      logger.warning(f"Expected stop reason 'stop', got {response['choices'][0]['finish_reason']}.")
-    return ChatMessage(
-      role=CHAT_ROLE.ASSISTANT,
-      content=response["choices"][0]["message"]["content"],
-    )
-  except openai.error.APIError as e:
-    logger.error(f"OpenAI API Error: {e}")
-    raise e
+  _msgs = [
+    {
+      "role": m.role.value,
+      "content": m.content,
+    } for m in messages
+  ]
+  # logger.trace(
+  #   "Submitting the following chat completion to OpenAI API...\n{msgs}".format(
+  #     msgs="\n".join([msg["content"] for msg in _msgs])
+  #   )
+  # )
+  while True:
+    logger.trace("Submitting chat to OpenAI...")
+    try:
+      # response = await asyncio.wait_for(
+      #   openai.ChatCompletion.acreate(
+      #     model=model,
+      #     # messages=list(map(lambda m: m.to_dict(), messages)),
+      #     messages=_msgs,
+      #     stream=False,
+      #     temperature=personality["tuning"]["temperature"],
+      #     top_p=personality["tuning"]["top_p"],
+      #   ),
+      #   timeout=90, # Prevents the bot from hanging
+      # )
+      response, stop_reason = await safe_openai_request(
+        chunk_timeout=2, # Chunks should be recieved within milliseconds
+        max_retries=3,
+        model=model,
+        messages=_msgs,
+        temperature=personality["tuning"]["temperature"],
+        top_p=personality["tuning"]["top_p"],
+      )
+      logger.trace("Response received.")
+      if stop_reason != "stop":
+        logger.warning(f"Expected stop reason 'stop', got {response['choices'][0]['finish_reason']}.")
+      return response
+    except openai.error.APIError as e:
+      logger.opt(exception=e).warning(f"OpenAI API Error. Will try again.")
+    except asyncio.TimeoutError:
+      logger.warning("OpenAI API timed out. Will try again")
 
 def load_persona(name: str, dir: str) -> ChatMessage:
   """Loads a persona from a file."""
   logger.trace(f"Loading persona {name} from {dir}")
   try:
     persona_path = pathlib.Path(dir) / f"{name}.md"
-    persona = persona_path.read_text()
-    return ChatMessage(
-      role=CHAT_ROLE.USER,
-      content=f"This is your persona:\n{persona}",
-    )
+    return persona_path.read_text()
   except FileNotFoundError:
     logger.error(f"Persona {name} not found in {dir}.")
     raise FileNotFoundError(f"Persona {name} not found in {dir}.")
@@ -231,30 +712,47 @@ class ParseError(Exception):
 
 async def _parse_and_retry_chat(
   messages: list[ChatMessage],
-  persona: ChatMessage,
   model: str,
   personality: str,
-  parse_response: Callable[..., Any],
+  parse_response: Callable[[str], T] = lambda s: s,
   max_retry_count: int = 0,
-) -> Any:
-  """Convience function that wraps a chat session with GPT such that it responds in JSON."""
+) -> T:
+  """Convience function that wraps a chat session with GPT. Handles retries up to max_retry_count. Parses the raw model output with parse_response."""
+  # type check the arguments
+  assert isinstance(messages, list)
+  assert all(isinstance(m, ChatMessage) for m in messages), f"All messages must be ChatMessage instances but got some of type {set(map(type, messages)) - set([ChatMessage])}."
+  assert isinstance(model, str)
+  assert isinstance(personality, str)
+  assert isinstance(parse_response, Callable)
+  assert isinstance(max_retry_count, int)
   retry_count = 0
   _messages = list(messages)
+  # Get the number of tokens used in the prompt.
+  total_tokens = count_tokens(model_lookup[model]['name'], *_messages)
+  if total_tokens < model_lookup[model]['max_tokens'] // 2:
+    pass
+  elif total_tokens > model_lookup[model]['max_tokens'] // 2:
+    logger.warning(f"Prompt exceeds 50% of maximum number of tokens for model {model}.")
+  elif total_tokens >= int(9 * model_lookup[model]['max_tokens'] / 10):
+    logger.warning(f"Prompt exceeds 90% the number of tokens for model {model}.")
+  elif total_tokens >= model_lookup[model]['max_tokens']:
+    logger.error(f"Prompt exceeds maximum number of tokens for model {model}.")
+    raise RuntimeError(f"Prompt exceeds maximum number of tokens for model {model}.")
   while True:
     response = await chat(
-      persona=persona,
       messages=_messages,
       model=model_lookup[model]["name"],
       personality=model_lookup[model]["personality"][personality]
     )
+    assert isinstance(response, str), f"Expected response to be a string but got {response.__class__.__name__}."
     try:
-      response = parse_response(response.content)
-      if response is None:
+      parsed_response = parse_response(response)
+      if parsed_response is None:
         raise RuntimeError(f"Function {parse_response.__name__} returned {None.__class__.__name__}")
-      return response
+      return parsed_response
     except ParseError as pe:
       logger.warning(f"Failed to parse response: {pe.error}")
-      logger.trace(f"Bad Response: {response.content}")
+      logger.trace(f"Bad Response: {response}")
       if retry_count > max_retry_count:
         logger.error(f"Failed to parse response after {max_retry_count} retries.")
         raise RuntimeError("Failed to parse response.")
@@ -290,13 +788,27 @@ def _parse_json_list(
     raise ParseError("invalid JSON detected", te) from te
   except json.JSONDecodeError as jde:
     raise ParseError("invalid JSON detected", jde.msg) from jde
-  
+
 async def generate_sme_descriptions(
-  problem_statement_message: ChatMessage,
-  vision_statement_message: ChatMessage,
+  problem_statement: str,
+  vision_statement: str,
   get_persona: Callable[..., ChatMessage],
-) -> dict[tuple[str, ...], str]:
+) -> dict[_sme_id, str]:
   """Generate a list of descriptions for potential SMEs that can contribute to the solutioning process."""
+  # type check the arguments
+  assert isinstance(problem_statement, str)
+  assert isinstance(vision_statement, str)
+  assert callable(get_persona)
+
+  problem_statement_message = ChatMessage(
+    role=CHAT_ROLE.USER,
+    content=problem_statement,
+  )
+  vision_statement_message = ChatMessage(
+    role=CHAT_ROLE.USER,
+    content=vision_statement,
+  )
+
   # Based on the problem and vision provided, generate a list of domain areas that are relevant to the problem.
   domain_excpetation_message = ChatMessage(
     role=CHAT_ROLE.USER,
@@ -490,10 +1002,11 @@ async def generate_sme_descriptions(
   }
 
 async def think_tank(
-  sme_descriptions: dict[tuple[str, ...], str],
-  problem_statement_message: ChatMessage,
-  vision_statement_message: ChatMessage,
-  get_persona: Callable[..., ChatMessage],
+  smes: list[Entity],
+  problem_statement: str,
+  vision_statement: str,
+  get_persona: Callable[[str], str],
+  model: str,
 ) -> ...:
   """A Think tank is a group of Subject Matter Experts (SMEs) who sit down together and discuss the problem, the vision, and the solution through a series of sessions.
   
@@ -517,34 +1030,239 @@ async def think_tank(
 
   Finally the fourth session is to select the best idea. The goal of this session is to select the best idea to implement. The SMEs should select the idea that best meets the vision, is the most realistic, is the most pragmatic, requires the least effort to implement, and requires the least effort to maintain & support. This is the output of the Think Tank.
   """
-    
+  # Type check all the arguments
+  assert isinstance(smes, list)
+  assert len(smes) >= 3, f"There must be at least three SMEs, but there are only {len(smes)}"
+  assert all(isinstance(sme, Entity) for sme in smes)
+  assert isinstance(problem_statement, str)
+  assert isinstance(vision_statement, str)
+  assert callable(get_persona)
+  assert isinstance(model, str)
+
+  # Create a Moderator Entity
+  moderator = Entity(
+    uuid=uuid.uuid5(uuid.NAMESPACE_DNS, "moderator"),
+    name="Moderator",
+    key=("moderator", "jackofalltrades"),
+    persona=get_persona("jack-of-all-trades"),
+  )
+
+  # Create some contextual data
+  context = {
+    "problem_statement": f"the problem statement is: {problem_statement}",
+    "vision_statement": f"the vision statement is: {vision_statement}",
+    "ground_rules": [
+      "Rule 1: Actively listen to others and avoid interrupting while they're speaking.",
+      "Rule 2: Respect and appreciate differing opinions and perspectives, even if you disagree.",
+      "Rule 3: Stay focused on the problem statement and vision statement and avoid going off-topic."
+    ]
+  }
+
+  # Start new transcript
+  transcript = ChatTranscript()
+
+  ### PreSession ###
+  """
+  1. Introductions and preliminary questioning
+    - Goal: Establish rapport among participants and clarify their expertise
+    - Call to action: "Let's start by introducing ourselves and sharing our areas of expertise."
+    - Summary: The moderator asks SMEs to introduce themselves, their background, and their expertise.
+
+  2. Setting ground rules for discussion
+    - Goal: Promote a respectful and inclusive environment for discussions
+    - Call to action: "Before we dive into the discussion, let's set some ground rules to ensure a productive and respectful conversation."
+    - Summary: The moderator presents ground rules, such as active listening and respecting different opinions, and invites SMEs to add any rules they deem necessary.
+
+  3. Clarifying session objectives and agenda
+    - Goal: Ensure everyone is aligned and focused on the goals of the session
+    - Call to action: "Now, let's briefly go over the objectives and agenda for today's session."
+    - Summary: The moderator presents the objectives of the PreSession Phase, the overall meeting plan, and the session agenda.
+
+  4. SMEs reflecting on each other's PoVs and sharing new conclusions
+    - Goal: Encourage collaboration and idea sharing among SMEs
+    - Call to action: "Let's now share our initial thoughts on the problem statement and vision statement, and reflect on each other's perspectives."
+    - Summary: The moderator asks SMEs for their initial PoVs and encourages them to incorporate novel information from other SMEs' PoVs, sharing new conclusions or connections.
+
+  5. Asking the customer for clarification
+    - Goal: Ensure a clear understanding of the problem and address any ambiguities
+    - Call to action: "Do we have any pressing questions for the customer that we need clarification on?"
+    - Summary: The moderator collects questions from SMEs and submits them to the customer for clarification, setting a deadline for the response.
+
+  6. Brief discussion among SMEs on initial questions or comments
+    - Goal: Dive deeper into the problem and explore potential solutions
+    - Call to action: "Let's now discuss any initial questions or comments on each other's PoVs."
+    - Summary: The moderator facilitates a brief discussion between SMEs, focusing on initial questions, comments, or insights related to the problem statement and vision statement.
+
+  """
+
+  # 1. Introductions and preliminary questioning
+  intro_message: ChatMessage = transcript.entity_said(
+    entity=moderator,
+    said="""Everyone, thank you for joining us today. My name is {moderator_name} and I will be facilitating this session. Let's start by introducing ourselves and sharing our areas of expertise.""".format(
+      moderator_name=moderator.name,
+    ),
+  )
+  # Ask the SMEs to introduce themselves and share their expertise
+  logger.info("Asking SMEs to introduce themselves and share their expertise")
+  sme_responses: list[str] = await asyncio.gather(
+    *[
+      sme.respond(
+        chat=[
+          intro_message.content,
+        ],
+        context=[
+          context["problem_statement"],
+          context["vision_statement"],
+        ],
+        model=model,
+        responding_personality="balanced",
+        reflection_personality="reserved",
+      )
+      for sme in smes
+    ],
+  )
+  assert len(sme_responses) == len(smes)
+  for sme, sme_response in zip(smes, sme_responses):
+    logger.info(f"SME {sme.name} replied to the moderator:\n{sme_response}")
+  # Record the SME responses in the transcript
+  for sme, sme_response in zip(smes, sme_responses):
+    transcript.entity_said(
+      entity=sme,
+      said=sme_response,
+      in_response_to=intro_message,
+    )
+  # Have the SMEs internally reflect on each other's PoVs. Record any thoughts in the entity's short term memory.
+  logger.info("Asking SMEs to reflect on each other's PoVs; reducing reflection to a single final thought.")
+  sme_reflections = await asyncio.gather(
+    *[
+      sme.think(
+        thought="\n".join([
+          sme_pov
+          for pov_owner, sme_pov
+          in zip(smes, sme_responses)
+          if pov_owner != sme
+        ]),
+        context=[
+          # The problem & vision statement
+          context["problem_statement"],
+          context["vision_statement"],
+          # The SME's PoV
+          next(sme_pov for pov_owner, sme_pov in zip(smes, sme_responses) if pov_owner == sme),
+        ],
+        model=model,
+        thinking_personality="balanced",
+        summary_personality="reserved",
+      )
+      # reduce_thoughts(
+      #   entity=sme,
+      #   thoughts=[
+      #     sme_pov
+      #     for pov_owner, sme_pov
+      #     in zip(smes, sme_responses)
+      #     if pov_owner != sme
+      #   ],
+      #   context=[
+      #     # The problem & vision statement
+      #     context["problem_statement"],
+      #     context["vision_statement"],
+      #     # The SME's PoV
+      #     next(sme_pov for pov_owner, sme_pov in zip(smes, sme_responses) if pov_owner == sme),
+      #   ],
+      #   model=model,
+      #   thinking_personality="creative",
+      #   summary_personality="reserved",
+      # )
+      for sme in smes
+    ],
+  )
+  # Commit the thoughts to the SME's short term memory
+  for sme, sme_reflection in zip(smes, sme_reflections):
+    logger.info(f"SME {sme.name} reflected on all the others SMEs' PoVs:\n{sme_reflection}")
+    sme.context.append(sme_reflection)
+
+  return 
+
+  # 2. Setting ground rules for discussion
+  transcript.entity_said(
+    entity=moderator,
+    said="Thank you for sharing your expertise. Before we dive into the discussion, let's set some ground rules to ensure a productive and respectful conversation.",
+  )
+
+
+
+
+  ### OLD ###
+
+  _name_to_message = lambda id: ChatMessage(
+    role=CHAT_ROLE.USER,
+    content=f"Your name is {sme_names[id]}.",
+  )
+
+  def _contextual_transcript_from_messages(messages: list[tuple[str, str]]) -> ChatMessage:
+    """Generate a contextual transcript from a list of messages ordered in time (oldest to newest)"""
+    # assert messages has the right types & has a length of at least 1
+    assert isinstance(messages, list)
+    assert all(isinstance(message, tuple) for message in messages)
+    assert all(isinstance(speaker, str) for message in messages for speaker in message)
+    assert all(isinstance(message, str) for message in messages for message in message)
+    return ChatMessage(
+      role=CHAT_ROLE.USER,
+      content="Here is the contextual chat transcript:\n{transcript}".format(
+        transcript="\n".join(
+          f"{speaker} said: {message}"
+          for speaker, message in messages
+        ),
+      ),
+    )
+
   # Template the Persona's from the SMEs
-  sme_persona_messages = [
-    ChatMessage(
+  sme_persona_messages: dict[_sme_id, ChatMessage] = {
+    sme_id: ChatMessage(
       role=CHAT_ROLE.USER,
       content=persona_templates['sme'].format(
         sme_description=sme_desc,
       ),
     )
-    for sme_desc in sme_descriptions.values()
-  ]
+    for sme_id, sme_desc in sme_descriptions.items()
+  }
+  _chat_response = tuple[str | None, str]
+  _chat_history = list[_chat_response]
+  # Track the individual SMEs responses
+  sme_chat_history: dict[_sme_id, _chat_history] = {
+    sme_id: []
+    for sme_id in sme_descriptions.keys()
+  }
+  moderator_chat_history: _chat_history = []
+  """Tracks the response from an individual SME. The key is the SME's ID. The value is a tuple of two messages: the first (optional) message is the message the SME is responding to, the second (required) message is the response from the SME."""
 
-  # TEST: Generate a response from the SMEs based on the problem statement & vision statement.
-
+  # Generate a response from the SMEs based on the problem statement & vision statement.
   contextual_header_message = ChatMessage(
     role=CHAT_ROLE.USER,
-    content="You are participating in a think tank as an SME. I will provide you some contextual information first & then I will share with you the conversational transcript.",
+    content="You are participating in a think tank as an SME. I will give contextual information for the session & the session's most recent conversational transcript."
+  )
+  contextual_info_message = ChatMessage(
+    role=CHAT_ROLE.USER,
+    content="This is the contextual information for the session:\nProblem Statment:\n{problem_statement}\nVision Statement:\n{vision_statement}\n".format(
+      problem_statement=problem_statement,
+      vision_statement=vision_statement,
+    )
+  )
+  no_contextual_chat_history_message = ChatMessage(
+    role=CHAT_ROLE.USER,
+    content="There is no previous chat history for this session.",
   )
   moderator_asks_preliminary_questions_message = ChatMessage(
     role=CHAT_ROLE.USER,
-    content="Here starts the conversation...\nThank you for joining us on today's session. I will be today's moderator. To start I would like to cover some preliminary items. First, I would like to ask each of you to briefly introduce your areas of expertise & your strengths. Second, please restate the problem statement as you understand it. Third, please restate the vision statement as you understand it. Lastly please tell us your initial thoughts on the customer's problem & vision statement.",
+    content="Thank you for joining us on today's session. I will be today's moderator. To start I would like to cover some preliminary items. First, I would like to ask each of you to briefly introduce your areas of expertise & your strengths. Second, please restate the problem statement as you understand it. Third, please restate the vision statement as you understand it. Lastly please tell us your initial thoughts on the customer's problem & vision statement.",
   )
+  moderator_chat_history.append((None, moderator_asks_preliminary_questions_message.content))
   
   responses = await asyncio.gather(*[
     _parse_and_retry_chat(
       messages=[
+        _name_to_message(sme_id),
         contextual_header_message,
-        problem_statement_message, vision_statement_message,
+        contextual_info_message, no_contextual_chat_history_message,
         moderator_asks_preliminary_questions_message,
       ],
       persona=sme_persona_message,
@@ -552,13 +1270,102 @@ async def think_tank(
       personality="balanced",
       parse_response=lambda s: s,
     )
-    for sme_persona_message in sme_persona_messages
+    for sme_id, sme_persona_message in sme_persona_messages.items()
   ])
   for response in responses:
     logger.info(f"Generated response...\n{response}")
+  
+  # Log the responses in the chat history
+  for sme_id, response in zip(sme_descriptions.keys(), responses):
+    assert isinstance(response, str), f"Expected response to be str but got {type(response).__name__}"
+    sme_chat_history[sme_id].append((None, response))
+  
+  # Ask each SME to provide their thoughts on another SME's response
+  async def _get_sme_opinion_on_all_other_responses(sme_id: _sme_id) -> dict[_sme_id, ChatMessage]:
+    sme_opinions = await asyncio.gather(*[
+      _parse_and_retry_chat(
+        messages=[
+          _name_to_message(sme_id),
+          contextual_header_message,
+          contextual_info_message,
+          _contextual_transcript_from_messages([
+            ("moderator", moderator_asks_preliminary_questions_message.content),
+            (sme_names[sme_id], sme_chat_history[sme_id][-1][1]),
+            (sme_names[other_sme_id], sme_chat_history[other_sme_id][-1][1]),
+          ]),
+          ChatMessage(
+            role=CHAT_ROLE.USER,
+            content=f"Consider {sme_names[other_sme_id]}'s response to my earlier question. Can you talk through your thoughts on their point of view of the customer's problem statement & vision statement?",
+          ),
+        ],
+        persona=sme_persona_messages[sme_id],
+        model="gpt3",
+        personality="balanced",
+        parse_response=lambda s: s,
+      )
+      for other_sme_id in filter(
+        lambda other_sme_id: other_sme_id != sme_id,
+        sme_descriptions.keys(),
+      )
+    ])
+    return {
+      other_sme_id: opinion
+      for other_sme_id, opinion in zip(
+        filter(
+          lambda other_sme_id: other_sme_id != sme_id,
+          sme_descriptions.keys(),
+        ),
+        sme_opinions,
+      )
+    }
+
+  sme_opinions: list[dict] = await asyncio.gather(*[
+    _get_sme_opinion_on_all_other_responses(sme_id)
+    for sme_id in list(sme_descriptions.keys())[0:1]
+  ])
+  # Assert that all opions are dicts with _sme_id keys & str values
+  assert all(
+    isinstance(sme_opinion, dict)
+    and all(
+      isinstance(key, tuple)
+      and isinstance(value, str)
+      for key, value in sme_opinion.items()
+    )
+    for sme_opinion in sme_opinions
+  )
+  moderator_chat_history.append((None, "Can provide your thoughts on SME's response to my earlier question?"))
+
+  for sme_id, opinions in zip(sme_descriptions.keys(), sme_opinions):
+    # assert that the opinions is a dict whoses keys are the _sme_ids for all other SMEs & the values are str
+    assert isinstance(opinions, dict)
+    assert all(
+      isinstance(key, tuple)
+      and key != sme_id
+      for key in opinions.keys()
+    )
+    assert all(
+      isinstance(value, str)
+      for value in opinions.values()
+    )
+    for other_sme_id, opinion_on in opinions.items():
+      # log the opinions to stderr
+      logger.info(f"{sme_names[sme_id]}'s opinion on {sme_names[other_sme_id]} is...\n{opinion_on}")
+      # Update the chat history
+      sme_chat_history[sme_id].append((moderator_chat_history[-1][1], opinion_on))
+  
+  # Log the chat transcript for each SME up till now
+  for sme_id in list(sme_descriptions.keys())[0:1]:
+    chat_transcript = [f"# Chat transcript for {sme_names[sme_id]}\n"]
+    for message_pair in sme_chat_history[sme_id]:
+      if message_pair[0] is not None:
+        chat_transcript.append(f"## Someone Said\n{message_pair[0]}\n")
+      chat_transcript.append(f"## {sme_names[sme_id]}\n{message_pair[1]}\n")
+    logger.trace("\n".join(chat_transcript))
 
 async def main(*args, **kwargs) -> int:
   """Main entry point for the program."""
+  global openapi_concurrent_requests_lock
+  openapi_concurrent_requests_lock = asyncio.Semaphore(kwargs["openai-concurrent"])
   cache_dir = pathlib.Path(kwargs["cache"])
   personas_dir = pathlib.Path(kwargs["personas"])
   if not cache_dir.exists():
@@ -576,25 +1383,18 @@ async def main(*args, **kwargs) -> int:
   load_api_token()
 
   # Load the Problem & Vision Statement
-  problem_statement = pathlib.Path(os.environ["CI_PROJECT_DIR"]) / "docs" / "ipc" / "problem-statement.md"
-  vision_statement = pathlib.Path(os.environ["CI_PROJECT_DIR"]) / "docs" / "ipc" / "vision-statement.md"
+  problem_statement_path = pathlib.Path(os.environ["CI_PROJECT_DIR"]) / "docs" / "ipc" / "problem-statement.md"
+  vision_statement_path = pathlib.Path(os.environ["CI_PROJECT_DIR"]) / "docs" / "ipc" / "vision-statement.md"
 
-  # Create Messages from the Problem & Vision Statement
-  problem_statement_message = ChatMessage(
-    role=CHAT_ROLE.USER,
-    content=f"Here is our problem statement describing what we want to solve:\n{problem_statement}",
-  )
-  vision_statement_message = ChatMessage(
-    role=CHAT_ROLE.USER,
-    content=f"Here is our vision statement describing what we believe the solution to our problem statement should be:\n{vision_statement}",
-  )
+  problem_statement = problem_statement_path.read_text()
+  vision_statement = vision_statement_path.read_text()
   
   if kwargs['phase-gen-smes']:
     # Generate a set of SMEs that will contribute to the problem solving process.
     logger.trace("Generating SME Descriptions...")
     sme_descriptions = await generate_sme_descriptions(
-      problem_statement_message,
-      vision_statement_message,
+      problem_statement,
+      vision_statement,
       get_persona=_load_persona,
     )
     # Cache the SME Descriptions
@@ -626,7 +1426,7 @@ async def main(*args, **kwargs) -> int:
     }
     logger.info(f"Loaded SME Descriptions from {sme_descriptions_path}")
     for sme_ids, sme_desc in sme_descriptions.items():
-      logger.info(f"{sme_ids}: {sme_desc}")
+      logger.trace(f"{sme_ids}: {sme_desc}")
 
   # Sanity check the SME Descriptions
   assert isinstance(sme_descriptions, dict)
@@ -640,14 +1440,45 @@ async def main(*args, **kwargs) -> int:
     for sme_id in sme_ids
   )
 
-  # Move on to the Think Tank phase
+  logger.info(f"Found {len(sme_descriptions)} SMEs")
 
+  # deterministically generate names for the SMEs. So long as the SMEs don't change, the names will be the same.
+  assert len(sme_descriptions) <= len(ANDROGYNOUS_NAMES), "Too many SMEs to generate names for!"
+  sme_human_names = {
+    sme_ids: tuple(ANDROGYNOUS_NAMES)[i]
+    for i, sme_ids in enumerate(sme_descriptions)
+  }
+  assert len(sme_human_names) == len(sme_descriptions)
+  logger.info(f"SME Human Names: {list(sme_human_names.values())}")
+
+  # Create UUIDs for each SME based off the hash of their keys
+  sme_uuids = {
+    sme_ids: uuid.uuid5(uuid.NAMESPACE_DNS, "|".join(sme_ids))
+    for sme_ids in sme_descriptions
+  }
+  assert len(sme_uuids) == len(sme_descriptions)
+
+  # Create the SME Entities
+  sme_entities = [
+    Entity(
+      uuid=sme_uuids[sme_key],
+      name=sme_human_names[sme_key],
+      key=sme_key,
+      persona=sme_descriptions[sme_key],
+      context=[],
+    )
+    for sme_key in sme_descriptions
+  ]
+  assert len(sme_entities) == len(sme_descriptions)
+
+  # Move on to the Think Tank phase
   if kwargs['phase-think-tank']:
     _ = await think_tank(
-      sme_descriptions,
-      problem_statement_message,
-      vision_statement_message,
+      sme_entities[0:3], # For now limit the number of SMEs to reduce costs
+      problem_statement,
+      vision_statement,
       get_persona=_load_persona,
+      model=kwargs["model"],
     )
 
   return 0
@@ -660,6 +1491,8 @@ def _parse_kwargs(*args: str, **kwargs: str) -> dict:
     "personas": f"{os.environ['CI_PROJECT_DIR']}/meta/personas/",
     "phase-gen-smes": False,
     "phase-think-tank": False,
+    "model": "gpt3",
+    "openai-concurrent": 10,
   }
   for arg in args:
     if arg.startswith("-"):
@@ -697,6 +1530,8 @@ Options:
     The path to a directory containing persona files. Defaults to {os.environ['CI_PROJECT_DIR']}/meta/personas/
   --verbose
     Enable verbose logging.
+  --openai-concurrent=INT
+    The maximum number of concurrent calls to make to the OpenAI API. Defaults to 10.
   --phase-gen-smes
     Generate SME Descriptions and save them to the cache directory.
   --phase-think-tank
@@ -717,9 +1552,13 @@ if __name__ == "__main__":
       _help()
       _rc = 0
     else:
+      start = time.monotonic()
       _rc = asyncio.run(main(*_args, **_kwargs))
+      finish = time.monotonic()
+      logger.success(f"This session consumed ~{total_token_count // 1000} units of 1000 tokens (~{total_token_count} tokens) in {finish - start:.2f}s. This is a rate of ~{int((total_token_count // 1000) / ((finish - start) / 60))} token-units/minute.")
   except Exception as e:
     logger.opt(exception=e).critical("Unhandled Exception raised during runtime...")
+    logger.error(f"This session consumed ~{total_token_count // 1000} units of 1000 tokens (~{total_token_count} tokens).")
   finally:
     sys.stdout.flush()
     sys.stderr.flush()
