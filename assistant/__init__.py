@@ -1,9 +1,9 @@
-import asyncio
+"""TODO: Add module docstring"""
 import enum
-import contextlib
 from abc import ABC, abstractmethod
 
-class Error(Exception):
+class AssistantError(Exception):
+  """Base class for exceptions in this module."""
   pass
 
 class _LoggingInterface(ABC):
@@ -35,6 +35,6 @@ class _DummyLogger(_LoggingInterface):
 
 _logger = _DummyLogger()
 
-class ENTITY(enum.Enum):
-  USER = "user"
-  ASSISTANT = "assistant"
+class ENTITY_KIND(enum.Enum):
+  USER = 1
+  ASSISTANT = 2

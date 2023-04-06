@@ -87,6 +87,7 @@ import datetime
 import uuid
 import networkx as nx
 import time
+import random
 
 T = TypeVar("T")
 
@@ -348,10 +349,10 @@ class Entity:
     context: Iterable[str],
     model: str,
     thinking_personality: str,
-    summary_personality: str,
   ) -> str:
-    """The entity reflects on a thought.
+    """The entity reflects on a thought seeking to improve it.
     The Entity references the following:
+      - It's Persona
       - It's internal context (ie. `entity.context`)
       - Environmental Context (in order provided) (`context` arbitrary textual data to be used as context)
       - The thought to reflect on (`thought`)
@@ -373,45 +374,47 @@ class Entity:
         _user_msg(content=f"# This is your persona\n{self.persona}"),
         _user_msg(content=self.render_context()),
         _user_msg(content="# Here are observations you have made\n{context}".format(context='\n'.join(context))),
-        _user_msg(content=f"# Contemplate the following, summarize your thoughts & walk me through it step by step\n{thought}"),
+        _user_msg(content=f"# Ruminate on the following, itemize your thoughts & explain your reasoning\n{thought}"),
       ],
       model=model,
       personality=thinking_personality,
     )
     logger.trace(f"Entity {self.name} is reflecting on it's thought: {initial_thought}")
-    # reflect on the initial thought
-    reflection = await _parse_and_retry_chat(
+    # conduct a challenge session
+    challenge_session = await _parse_and_retry_chat(
       messages=[
         _user_msg(content=f"# This is your persona\n{self.persona}"),
         _user_msg(content=self.render_context()),
-        _user_msg(content="Here are observations you have made: {context}".format(context='\n'.join(context))),
-        _user_msg(content=f"Contemplate the following, summarize your thoughts & walk me through it step by step: {thought}"),
-        _assistant_msg(content=initial_thought),
-        _user_msg(content=f"Very intriguing. In your opinion, what is most relevant or most impactful? Why?"),
+        _user_msg(content="# Here are observations you have made\n{context}".format(context='\n'.join(context))),
+        _user_msg(content=f"# Ruminate on the following, itemize your thoughts & explain your reasoning\n{thought}"),
+        _assistant_msg(content=f"# My Initial Thoughts\n{initial_thought}"),
+        _user_msg(content=f"# Reframe your thoughts, challenge your assumptions, & consider alternative points of view\n{initial_thought}"),
       ],
       model=model,
       personality=thinking_personality,
     )
-    logger.trace(f"Entity {self.name} is summarizing it's reflection: {reflection}")
-    # Generate a salient description of the thought
-    summary = await _parse_and_retry_chat(
+    logger.trace(f"Entity {self.name} is challenging it's thoughts: {challenge_session}")
+    # reflect on the challenge session & iterate on the initial thought
+    reflection = await _parse_and_retry_chat(
       messages=[
-        # _user_msg(content=f"# This is your persona\n{self.persona}"),
-        # _user_msg(content=self.render_context()),
-        # _user_msg(content="Here are observations you have made: {context}".format(context='\n'.join(context))),
-        _assistant_msg(content=initial_thought),
-        _assistant_msg(content=reflection),
-        _user_msg(content="Produce a salient summary as an itemized list of ONLY three points that are concise & succinct"),
+        _user_msg(content=f"# This is your persona\n{self.persona}"),
+        _user_msg(content=self.render_context()),
+        _user_msg(content="# Here are observations you have made\n{context}".format(context='\n'.join(context))),
+        _user_msg(content=f"# Ruminate on the following, itemize your thoughts & explain your reasoning\n{thought}"),
+        _assistant_msg(content=f"# My Initial Thoughts\n{initial_thought}"),
+        _user_msg(content=f"# Reframe your thoughts, challenge your assumptions, & consider alternative points of view\n{initial_thought}"),
+        _assistant_msg(content=f"# My Challenge Session\n{challenge_session}"),
+        _user_msg(content=f"# Reflect on your challenge session & iterate on your original thoughts incorporating ideas & points of view that make it better\n{challenge_session}"),
       ],
       model=model,
-      personality=summary_personality,
+      personality=thinking_personality,
     )
-    logger.trace(f"Entity {self.name} summarized it's thought as: {summary}")
-    return summary
+    logger.trace(f"Entity {self.name} summarized it's thought as: {reflection}")
+    return reflection
 
   def to_dict(self):
     return {
-      "id": self.id.hex,
+      "uuid": self.uuid.hes,
       "name": self.name,
       "key": list(self.key) if self.key is not None else None,
       "persona": self.persona if self.persona is not None else None,
@@ -421,7 +424,7 @@ class Entity:
   @classmethod
   def from_dict(cls, d: dict[str, Any]):
     return cls(
-      id=uuid.UUID(d["id"]),
+      uuid=uuid.UUID(d["uuid"]),
       name=d["name"],
       key=tuple(d["key"]) if d["key"] is not None else None,
       persona=d["persona"] if d["persona"] is not None else None,
@@ -1028,7 +1031,7 @@ async def think_tank(
   - How much effort is required to implement the idea?
   - How much effort is required to maintain & support the idea?
 
-  Finally the fourth session is to select the best idea. The goal of this session is to select the best idea to implement. The SMEs should select the idea that best meets the vision, is the most realistic, is the most pragmatic, requires the least effort to implement, and requires the least effort to maintain & support. This is the output of the Think Tank.
+  Finally the fourth session is to select the best ideas to implement. The SMEs should select the ideas that best match the vision, is the most realistic, is the most pragmatic, requires the least effort to implement, and requires the least effort to maintain & support. This is the output of the Think Tank.
   """
   # Type check all the arguments
   assert isinstance(smes, list)
@@ -1038,6 +1041,17 @@ async def think_tank(
   assert isinstance(vision_statement, str)
   assert callable(get_persona)
   assert isinstance(model, str)
+
+  # Create a Salient Summary Entity; this isn't really a contributor but a utility to optimize tokenization
+  knowledge_synthesis = Entity(
+    uuid=uuid.uuid5(uuid.NAMESPACE_DNS, "salience"),
+    name="Salience",
+    key=("salience", "summary", "knowledgesynthesizer"),
+    persona=get_persona("knowledge-synthesizer"),
+  )
+  knowledge_synthesis.context.append(
+    "the information to summarize will be subsequently provided. I shouldn't need to ask for it. I also shouldn't summarize or otherwise include information about myself."
+  )
 
   # Create a Moderator Entity
   moderator = Entity(
@@ -1051,49 +1065,92 @@ async def think_tank(
   context = {
     "problem_statement": f"the problem statement is: {problem_statement}",
     "vision_statement": f"the vision statement is: {vision_statement}",
-    "ground_rules": [
-      "Rule 1: Actively listen to others and avoid interrupting while they're speaking.",
-      "Rule 2: Respect and appreciate differing opinions and perspectives, even if you disagree.",
-      "Rule 3: Stay focused on the problem statement and vision statement and avoid going off-topic."
-    ]
+    "ground_rules": "these are the ground rules for the discussion\n{rules}".format(
+      rules="\n".join([
+      "Rule 1: Respect and appreciate differing opinions and perspectives, even if you disagree.",
+      "Rule 2: Stay focused on the problem statement and vision statement and avoid going off-topic."
+      ])
+    )
   }
 
   # Start new transcript
   transcript = ChatTranscript()
 
+  ### Session 1: Problem Space Exploration ###
+  """
+  The Goal of session 1 is to explore the problem space. The SMEs should ask questions to clarify the problem. They should also ask questions to understand the problem from different perspectives.
+  """
+
+  # Ask for initial thoughts on the problem statement & the vision statement
+  sme_thought = "What are my initial thoughts on the customer's problem statement and vision statement?"
+
+  logger.info("Asking SMEs for their initial thoughts on the problem statement and vision statement...")
+  sme_responses = await asyncio.gather(*[
+    sme.think(
+      thought=sme_thought,
+      context=list(context.values()),
+      model=model,
+      thinking_personality="balanced",
+      summary_personality="reserved",
+    )
+    for sme in smes
+  ])
+
+  moderator_thought = "How would I summarize the SME's intial thoughts on the problem statement and vision statement?"
+  logger.info("Generating a summarization of the SME's initial thoughts on the problem statement and vision statement...")
+  initial_thoughts_summary = await moderator.think(
+    thought=moderator_thought,
+    context=[
+      *context.values(),
+      *[
+        f"{sme.name}'s initial thoughts are:\n{sme_response}"
+        for sme, sme_response in zip(smes, sme_responses)
+      ],
+    ],
+  )
+  context["initial_thoughts"] = f"Everyone's initial thoughts on the problem & vision is summarized as:\n{initial_thoughts_summary}"
+
+  # Ask the SMEs to discuss the problem space. They should think through how to begin approaching the problem. What challenges might they run into? What second or third order problems might they also need to solve? Are there any assumptions that they need to verify? What questions do they keep coming back to?
+  sme_thought = "How would I approach the problem? What challenges might I run into? What second or third order problems might I also need to solve? Are there any assumptions that I need to verify? What questions do I keep coming back to?"
+  sme_povs = await asyncio.gather(*[
+    sme.think(
+      thought=sme_thought,
+      context=list(context.values()),
+      model=model,
+      thinking_personality="balanced",
+      summary_personality="reserved",
+    )
+    for sme in smes
+  ])
+  # TODO: Salient summary & inject into SME internal context
+
+  # Ask one SME to describe the problem space in their own words. Have the other SMEs ask questions to clarify the description. Do this at least three times, each time with a different SME.
+  for sme in random.choices(smes, k=3):
+    moderator_question = "Can you describe the problem space in your own words?"
+    sme_response = ...
+    for other_sme in list(smes - set(sme)):
+      moderator_question = f"What questions do you have for {sme.name} & their description of the problem space?"
+      other_sme_questions = ...
+      sme_answers = ...
+  
+  # Take the descriptions, questions & answers. Summarize the problem space.
+  moderator_thought = "How would I summarize the problem space?"
+  #TODO Log the problem space summary in the chat transcript
+
+  # In a round robin fashion, have each SME add or remove one item from the summary. Do this at least twice.
+  for _ in range(2):
+    for sme in tuple(smes):
+      moderator_question = "Select one thing to add, remove or adjust in the description of the problem space. Please walk us through your thought process."
+      sme_response = ...
+      moderator_thought = "How would I update the problem space summary based on {sme.name}'s response?"
+      # TODO: Log the updated problem space summary in the chat transcript
+
+  ### Session 4: Prioritization & Selection ###
+  """
+  The Goal of session 4 is to prioritize the ideas generated & select those ideas that best implement the vision.
+  """
+
   ### PreSession ###
-  """
-  1. Introductions and preliminary questioning
-    - Goal: Establish rapport among participants and clarify their expertise
-    - Call to action: "Let's start by introducing ourselves and sharing our areas of expertise."
-    - Summary: The moderator asks SMEs to introduce themselves, their background, and their expertise.
-
-  2. Setting ground rules for discussion
-    - Goal: Promote a respectful and inclusive environment for discussions
-    - Call to action: "Before we dive into the discussion, let's set some ground rules to ensure a productive and respectful conversation."
-    - Summary: The moderator presents ground rules, such as active listening and respecting different opinions, and invites SMEs to add any rules they deem necessary.
-
-  3. Clarifying session objectives and agenda
-    - Goal: Ensure everyone is aligned and focused on the goals of the session
-    - Call to action: "Now, let's briefly go over the objectives and agenda for today's session."
-    - Summary: The moderator presents the objectives of the PreSession Phase, the overall meeting plan, and the session agenda.
-
-  4. SMEs reflecting on each other's PoVs and sharing new conclusions
-    - Goal: Encourage collaboration and idea sharing among SMEs
-    - Call to action: "Let's now share our initial thoughts on the problem statement and vision statement, and reflect on each other's perspectives."
-    - Summary: The moderator asks SMEs for their initial PoVs and encourages them to incorporate novel information from other SMEs' PoVs, sharing new conclusions or connections.
-
-  5. Asking the customer for clarification
-    - Goal: Ensure a clear understanding of the problem and address any ambiguities
-    - Call to action: "Do we have any pressing questions for the customer that we need clarification on?"
-    - Summary: The moderator collects questions from SMEs and submits them to the customer for clarification, setting a deadline for the response.
-
-  6. Brief discussion among SMEs on initial questions or comments
-    - Goal: Dive deeper into the problem and explore potential solutions
-    - Call to action: "Let's now discuss any initial questions or comments on each other's PoVs."
-    - Summary: The moderator facilitates a brief discussion between SMEs, focusing on initial questions, comments, or insights related to the problem statement and vision statement.
-
-  """
 
   # 1. Introductions and preliminary questioning
   intro_message: ChatMessage = transcript.entity_said(
@@ -1513,13 +1570,16 @@ def _parse_args(*args: str, **kwargs: str) -> list:
 
 def _help():
   print(f"""
-Usage: {sys.argv[0]} [OPTIONS]
+Usage: {sys.argv[0]} [OPTIONS] [SUBCMD] [ARGS...]
 
 About:
   ...
 
 Args:
-  ...
+  SUBCMD:
+    The subcommand to run.
+  ARGS:
+    The arguments to pass to the subcommand.
 
 Options:
   -h, --help
@@ -1536,6 +1596,15 @@ Options:
     Generate SME Descriptions and save them to the cache directory.
   --phase-think-tank
     Run the Think Tank phase of the process.
+  
+  Subcommands:
+    prompt:
+      Run a single-shot conversation with a persona.
+      About: 
+    chat:
+      Have a chat conversation with a persona.
+    think-tank:
+      Run the Think Tank phase of the process.
   """)
 
 if __name__ == "__main__":

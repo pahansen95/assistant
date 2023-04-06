@@ -1,0 +1,7 @@
+Our vision is to create a communication protocol for distributed systems that is easy to use and facilitates the exploration of emergent properties and intelligence. The protocol should be designed with scalability in mind, and allow for dynamic and flexible experimentation with large numbers of agents. Our protocol will be focused on natural language and textual data, and should be optimized for use cases where agents can perform simple computational tasks that can be combined to optimize solutions.
+
+To achieve this vision, we will develop a new communication protocol that leverages existing technologies and standards when possible, but is designed specifically to meet the needs of the project. The protocol will be developed with simplicity and ease of use in mind, with minimal boilerplate code required. We will also provide comprehensive documentation and example code to enable developers to quickly and easily implement the protocol in their own projects.
+
+Our solution will not require a separate service, and will be optimized for use with the Asyncio framework and Kubernetes for deployment. We will prioritize security and encryption features, including the ability to use mutual Transport Layer Security (mTLS) to protect the integrity and confidentiality of communication.
+
+Overall, our vision is to create a communication protocol that enables researchers and developers to easily experiment with emergent properties and intelligence in large-scale distributed systems, without being hindered by complex or unwieldy communication protocols.

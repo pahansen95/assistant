@@ -12,11 +12,11 @@ from typing import AsyncIterable, Any
 
 from loguru import logger
 
-from assistant.conversation import MessagingInterface
-from assistant.conversation.flow import InteractiveSession
-from assistant.conversation.memory import EphemeralMemory
-from assistant.llm import MODEL_CLASS, ModelInterface, load_llm
-from assistant import _logger, _LoggingInterface, ENTITY
+from _assistant.conversation import MessagingInterface
+from _assistant.conversation.flow import InteractiveSession
+from _assistant.conversation.memory import EphemeralMemory
+from _assistant.llm import MODEL_CLASS, ModelInterface, load_llm
+from _assistant import _logger, _LoggingInterface, ENTITY
 
 # patch the module's logger
 class _Logger(_LoggingInterface):
