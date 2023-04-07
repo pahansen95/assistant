@@ -563,23 +563,7 @@ async def _yield_chunks(
   streaming_response: AsyncIterable[dict],
   chunk_recieved: asyncio.Event,
 ) -> AsyncGenerator[str, None]:
-  async for chunk in streaming_response:
-    # Get the reply from the response
-    # TODO: Support multiple choices
-    if chunk["choices"][0]["delta"] != {}:
-      if "content" in chunk["choices"][0]["delta"]:
-        if chunk["choices"][0]["delta"]["content"]:
-          chunk_recieved.set()
-          yield chunk["choices"][0]["delta"]["content"]
-        continue # Skip to the next chunk if there is no content
-      elif "role" in chunk["choices"][0]["delta"]:
-        continue # Skip to the next chunk
-    # Check if the model finished it's reply
-    if chunk["choices"][0]["finish_reason"] == None:
-      continue
-    else:
-      raise _StreamStopped(chunk['choices'][0]['finish_reason'])
-
+  
 async def _gather_response(
   streaming_response: AsyncIterable[dict],
   chunk_recieved: asyncio.Event,
