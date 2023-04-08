@@ -4,8 +4,26 @@ import uuid
 from typing import Iterable, Any
 
 @dataclass
-class Entity(EntityProperties.PropsMixin, EntityProperties, EntityInterface):
-  """A Contributor to a Conversation. key & persona are optional & don't contribute the entity's identity."""
+class ExternalEntity(EntityProperties.PropsMixin, EntityProperties):
+  """An external user is an entity that we don't control. We can only responde to them."""
+  _name: str
+  """The name of the external user."""
+  _description: str
+  """The description of the external user."""
+  _uuid: uuid.UUID
+  """The UUID of the external user."""
+
+  def __post_init__(self):
+    _logger.debug(f"{self.name=}")
+    _logger.debug(f"{self.description=}")
+    _logger.debug(f"{self.uuid=}")
+  
+  def __hash__(self) -> int:
+    return hash((self.uuid.hex, self.name))
+
+@dataclass
+class InternalEntity(EntityProperties.PropsMixin, EntityProperties, EntityInterface):
+  """An entity over which we have control over (ie an assistant). key & persona are optional & don't contribute the entity's identity."""
   _name: str
   """The name of the entity."""
   _description: str
@@ -34,6 +52,26 @@ class Entity(EntityProperties.PropsMixin, EntityProperties, EntityInterface):
     return "# You remember the following\n{context}".format(
       context="\n".join(f"- {c}" for c in self.context)
     )
+
+  async def thoughts_on(
+    self,
+    chat: Iterable[str],
+    context: Iterable[str],
+    model: str,
+    personality: str,
+  ) -> str:
+    """The entity provides it's initial thoughts on a topic, stepping through it's throught process & pointing out any assumptions it makes. (aka single-shot)"""
+    raise NotImplementedError
+  
+  async def reply_to(
+    self,
+    chat: Iterable[str],
+    context: Iterable[str],
+    model: str,
+    personality: str,
+  ) -> str:
+    """The entity replies to a specific message without any internal reflection. (aka single-shot)"""
+    raise NotImplementedError
   
   async def respond(
     self,
@@ -51,6 +89,25 @@ class Entity(EntityProperties.PropsMixin, EntityProperties, EntityInterface):
     - Environmental Context (in order provided) (`context` arbitrary textual data to be used as context)
     - Chat Transcript (in order provided) (`chat` should be ordered with the oldest message first)
     """
+    assert len(chat) > 0, "Chat must have at least one message"
+    _logger.debug(f"Entity {self.name} has been asked to respond to the following chat\n{chat[-1]}")
+    _logger.trace("Entity {self.name} has the following chat history\n{chat_history}".format(
+      self=self,
+      chat_history='\n'.join(
+        f'## {i} Chat{"s" if i > 1 else ""} ago\n{c}\n'
+        for i, c in enumerate(list(reversed(chat))[1:], start=2)
+      ),
+    ))
+    _logger.trace(f"Entity {self.name} has the following internal context\n{self.render_context()}")
+    _logger.trace("Entity {self.name} has the following environmental context\n{context}".format(
+      self=self,
+      context='\n'.join(
+        f'## Context {i}\n{c}\n'
+        for i, c in enumerate(context)
+      ),
+    ))
+    _logger.trace(f"Entity {self.name} has the following persona\n{self.persona}")
+    _logger.trace(f"Entity {self.name} is using the following model\n{model}")
     _user_msg = lambda content: PromptMessage(
       content=content,
       role=PROMPT_MESSAGE_ROLE.USER,
@@ -58,20 +115,24 @@ class Entity(EntityProperties.PropsMixin, EntityProperties, EntityInterface):
     # Entity will come up with a response
     initial_response = await self._send(
       messages=[
-        _user_msg(f"Your name is {self.name}"),
-        _user_msg(f"# This is your persona\n{self.persona}"),
-        _user_msg(self.render_context()),
-        _user_msg("# Here are observations you have made\n{context}".format(context='\n'.join(f'- {c}' for c in context))),
-        _user_msg("# Here is the conversation so far\n"),
-        *[
-          _user_msg(c)
-          for c in chat
-        ],
+        msg
+        for msg in [
+          _user_msg(f"Your name is {self.name}") if self.name is not None else None,
+          _user_msg(f"# This is your persona\n{self.persona}") if self.persona is not None else None,
+          _user_msg(self.render_context()) if len(self.context) > 0 else None,
+          _user_msg("# Here are observations you have made\n{context}".format(context='\n'.join(f'- {c}' for c in context))) if len(context) > 0 else None,
+          _user_msg("# Here is the conversation so far\n"),
+          *[
+            _user_msg(c)
+            for c in chat
+          ],
+        ] if msg is not None
       ],
       model=model,
       personality=responding_personality,
     )
-    _logger.trace(f"Entities {self.name} initial response: {initial_response}")
+    _logger.debug(f"Entity {self.name} initial response\n{initial_response}")
+    return initial_response
     # Let the entity think about it's response
     # reflective_thought = "Here is the conversation you are replying to:\n{conversation}You want to respond with: {response}. How could you improve your response? ".format(
     #   response=initial_response,
@@ -81,6 +142,7 @@ class Entity(EntityProperties.PropsMixin, EntityProperties, EntityInterface):
       response=initial_response,
       chat=chat[-1],
     )
+    _logger.debug(f"Entity {self.name} is reflecting on it's response with the following thought\n{reflective_thought}")
     reflection = await self.think(
       thought=reflective_thought,
       # context=context,
@@ -88,8 +150,9 @@ class Entity(EntityProperties.PropsMixin, EntityProperties, EntityInterface):
       model=model,
       thinking_personality=reflection_personality,
     )
-    _logger.trace(f"Entities {self.name} reflection on it's thought: {reflection}")
+    _logger.debug(f"Entity {self.name} concluded\n{reflection}")
     # Generate another response incorporating the reflection
+    _logger.trace(f"Entity {self.name} is revising it's response")
     revised_response = await self._send(
       messages=[
         _user_msg(f"# This is your persona\n{self.persona}"),
@@ -106,7 +169,7 @@ class Entity(EntityProperties.PropsMixin, EntityProperties, EntityInterface):
       model=model,
       personality=responding_personality,
     )
-    _logger.trace(f"Entities {self.name} revised response: {revised_response}")
+    _logger.debug(f"Entity {self.name} revised it's response\n{revised_response}")
     # TODO: Add Heuristics to determine if the response is any good
     return revised_response
   
@@ -136,10 +199,12 @@ class Entity(EntityProperties.PropsMixin, EntityProperties, EntityInterface):
     _logger.trace(f"Entity: {self.name} is thinking about: {thought}")
     initial_thought = await self._send(
       messages=[
-        _user_msg(f"# This is your persona\n{self.persona}"),
-        _user_msg(self.render_context()),
-        _user_msg("# Here are observations you have made\n{context}".format(context='\n'.join(context))),
-        _user_msg(f"# Ruminate on the following, itemize your thoughts & explain your reasoning\n{thought}"),
+        msg for msg in [
+          _user_msg(f"# This is your persona\n{self.persona}") if self.persona is not None else None,
+          _user_msg(self.render_context()) if len(self.context) > 0 else None,
+          _user_msg("# Here are observations you have made\n{context}".format(context='\n'.join(context))) if len(context) > 0 else None,
+          _user_msg(f"# Ruminate on the following, itemize your thoughts & explain your reasoning\n{thought}"),
+        ] if msg is not None
       ],
       model=model,
       personality=thinking_personality,

@@ -10,7 +10,7 @@ import os
 import pathlib
 import sys
 import uuid
-from typing import TypeVar
+from typing import TypeVar, AsyncGenerator
 
 import discord
 from discord.commands import option as discord_option
@@ -19,8 +19,11 @@ from loguru import logger
 import loguru._recattrs
 
 import assistant
+import swarm
 import assistant.entity as entity
 import assistant.openai as openai
+import assistant.transcript as transcript
+import time
 
 T = TypeVar("T")
 
@@ -84,15 +87,20 @@ async def discord_bot(
   guild_ids: list[int],
 ) -> int:
   """Main entry point for the discord bot."""
-  bot_token = os.environ["DISCORD_BOT_TOKEN"]
-  
-  bot_entity = entity.Entity(
-    _uuid=uuid.uuid4(),
-    _name="Jack",
-    _description="A bot that uses GPT to chat with you.",
+
+  chat_transcript = transcript.ChatTranscript()
+
+  bot_ready = asyncio.Event()
+  bot_entity = entity.InternalEntity(
+    _uuid=None,
+    _name=None,
+    _description="Jack",
     _send=model_interface,
     persona=load_persona_from_dir("jack-of-all-trades", persona_dir),
   )
+
+  bot_token = os.environ["DISCORD_BOT_TOKEN"]
+  
   current_model = "gpt3"
   current_context = []
 
@@ -109,20 +117,87 @@ async def discord_bot(
   
   logger.trace("Registering Discord Bot Commands...")
 
-  # @bot.event
-  # async def on_connect():
-  #   logger.success("Connected to Discord.")
+  def chat_message_from_discord_message(
+    discord_message: discord.Message,
+  ) -> assistant.ChatMessage:
+    """Converts a discord message to a chat message."""
+    logger.annoy(f"Converting discord message to chat message")
+    
+    if discord_message.author == bot.user:
+      _entity_class = entity.InternalEntity
+      _class_kwargs = {
+        "_send": model_interface,
+      }
+    else:
+      _entity_class = entity.ExternalEntity
+      _class_kwargs = {}
+
+    return assistant.ChatMessage(
+      entity=_entity_class(
+        _name=f"{discord_message.author.name}#{discord_message.author.discriminator}",
+        _description=discord_message.author.name,
+        _uuid=uuid.uuid5(uuid.NAMESPACE_DNS, f"{discord_message.author.name}#{discord_message.author.discriminator}"),
+        **_class_kwargs,
+      ),
+      content=discord_message.content,
+      published=discord_message.created_at,
+    )
   
-  # @bot.event
-  # async def on_disconnect():
-  #   logger.warning("Disconnected from Discord.")
+  async def chat_message_from_discord_message_reference(
+    discord_message_reference: discord.MessageReference,
+  ) -> assistant.ChatMessage:
+    """Converts a discord message reference to a chat message."""
+    logger.annoy(f"Converting discord message reference to chat message")
+    return chat_message_from_discord_message(
+      await bot.get_channel(discord_message_reference.channel_id).fetch_message(discord_message_reference.message_id)
+    )
+
+  async def retrieve_reply_chain(
+    message: discord.Message,
+    depth: int | None = None,
+  ) -> list[assistant.ChatMessage]:
+    """Retrieves the reply chain for a discord message up to an optional depth. The youngest message is last."""
+    logger.trace(f"Retrieving reply chain for {message.id}")
+    cur_msg: discord.Message = message
+    msg_chain: list[assistant.ChatMessage] = [
+      chat_message_from_discord_message(cur_msg)
+    ]
+    while cur_msg.reference:
+      logger.trace(f"Message has a reference, retrieving message...")
+      cur_msg = await message.channel.fetch_message(cur_msg.reference.message_id)
+      msg_chain.append(
+        chat_message_from_discord_message(cur_msg)
+      )
+      if depth is not None and len(msg_chain) >= depth:
+        break
+    logger.trace(f"Reply chain found a total of {len(msg_chain)} messages")
+    if depth is not None:
+      if depth == 0:
+        logger.warning(f"Depth is 0, returning empty list")
+      logger.trace(f"Returning {depth} messages from the reply chain")
+      return list(reversed(msg_chain))[:depth]
+    else:
+      logger.trace(f"Returning all messages from the reply chain")
+      return list(reversed(msg_chain))
+
+  @bot.event
+  async def on_connect():
+    logger.success("Connected to Discord.")
   
-  # @bot.event
-  # async def on_resumed():
-  #   logger.success("Resumed connection to Discord.")
+  @bot.event
+  async def on_disconnect():
+    bot_ready.clear()
+    logger.warning("Disconnected from Discord.")
+  
+  @bot.event
+  async def on_resumed():
+    logger.success("Resumed connection to Discord.")
   
   @bot.event
   async def on_ready():
+    bot_entity._name = f"{bot.user.name}#{bot.user.discriminator}"
+    bot_entity._uuid = uuid.uuid5(uuid.NAMESPACE_DNS, f"{bot.user.name}#{bot.user.discriminator}")
+    bot_ready.set()
     logger.success(f"Logged in as {bot.user.name} ({bot.user.id})")
     await bot.change_presence(
       status=discord.Status.online,
@@ -134,7 +209,10 @@ async def discord_bot(
 
   @bot.event
   async def on_message(message: discord.Message):
-
+    # Block until all the backend is setup
+    if not bot_ready.is_set():
+      logger.annoying("Waiting for bot to be ready...")
+      await bot_ready.wait()
     # Don't respond to ourselves or other bots (for now as a failsafe)
     if (
       (message.author == bot.user) or
@@ -143,26 +221,96 @@ async def discord_bot(
       return
     
     if message.mentions and bot.user in message.mentions:
-      logger.trace(f"Message mentions bot: {message.content}")
-      async with message.channel.typing():
-        try:
-          logger.trace("Responding to message...")
-          response = await bot_entity.respond(
-            chat=[message.content],
-            context=current_context,
-            model=current_model,
-            responding_personality=assistant.PROMPT_PERSONALITY.BALANCED,
-            reflection_personality=assistant.PROMPT_PERSONALITY.RESERVED,
-          )
-        except Exception as e:
-          logger.opt(exception=e).error("Error while responding to message.")
-          response = "I'm sorry, I'm having trouble responding to you right now."
-      
-      logger.trace(f"Sending response: {response}")
-      await message.channel.send(
-        content=response,
-      )
+      logger.debug(f"Message mentions bot: {message.content}")
+      # Remove the bot mention from the message
+      message_content = message.content.replace(f"<@{bot.user.id}>", "").strip()
+
+      logger.trace("Acquiring chat transcript lock...")
+      async with chat_transcript:
+        logger.trace("Acquired chat transcript lock.")
+        # Add the message to the transcript
+        # check if the user already exists
+        _message_ref = None
+        if message.reference:
+          _message_ref = await chat_message_from_discord_message_reference(message.reference)
+          
+        if not chat_transcript.message_exists(_message_ref):
+          logger.debug("Message is a reply to a message that doesn't exist in the transcript, retrieving reply chain...")
+          _reply_chain = await retrieve_reply_chain(message)
+          # check that the reply chain is sorted oldest to youngest
+          assert _reply_chain == sorted(_reply_chain, key=lambda x: x.published), "Reply chain is not sorted oldest to youngest"
+          # Add the messages to the transcript
+          logger.debug("Logging reply chain in the transcript...")
+          for index, _reply in enumerate(_reply_chain): # oldest to youngest
+            logger.annoy(f"Logging reply in the transcript.")
+            in_response_to = None
+            if index > 0:
+              in_response_to = _reply_chain[index - 1]
+            chat_transcript.entity_said(
+              entity=_reply.entity,
+              said=_reply.content,
+              when=_reply.published,
+              in_response_to=in_response_to,
+            )
+
+        logger.debug("Logging the user's message in the transcript...")
+        user_msg = chat_transcript.entity_said(
+          entity=entity.ExternalEntity(
+            _name=f"{message.author.name}#{message.author.discriminator}",
+            _description=message.author.name,
+            _uuid=uuid.uuid5(uuid.NAMESPACE_DNS, f"{message.author.name}#{message.author.discriminator}"),
+          ),
+          said=message_content,
+          when=message.created_at,
+          in_response_to=_message_ref
+        )
+        logger.debug("Getting the previous messages from the transcript...")
+        message_history = chat_transcript.get_message_history(
+          user_msg
+        )
+        logger.debug(f"Found {len(message_history)} messages in the transcript.")
+        async with message.channel.typing():
+          try:
+            logger.debug("Responding to message...")
+            response = await bot_entity.respond(
+              chat=[f"# {m.entity.name} said\n{m.content}" for m in message_history],
+              context=current_context,
+              model=current_model,
+              responding_personality=assistant.PROMPT_PERSONALITY.BALANCED,
+              reflection_personality=assistant.PROMPT_PERSONALITY.RESERVED,
+            )
+            logger.debug(f"Replying to original message author")
+            bot_response = await message.reply(
+              content=response,
+            )
+            logger.debug("Logging the bot's response in the transcript...")
+            chat_transcript.entity_said(
+              entity=bot_entity,
+              said=response,
+              when=bot_response.created_at.timestamp(),
+              in_response_to=user_msg
+            )
+            # await message.channel.send(
+            #   content=response,
+            # )
+          except Exception as e:
+            logger.opt(exception=e).error("Error while responding to message.")
+            response = "I'm sorry, I'm having trouble responding to you right now."
   
+  @bot.slash_command(name="amnesia", help="The bot forget's everything.")
+  async def _reset_context(
+    ctx: discord.ApplicationContext,
+  ):
+    if not bot_ready.is_set():
+      logger.annoying("Waiting for bot to be ready...")
+      await bot_ready.wait()
+    bot_entity.context = []
+    await ctx.respond(
+      "Who am I? Where am I? What is this place?",
+      ephemeral=True,
+      delete_after=5*60,
+    )
+
   @bot.slash_command(name="change-persona", help="Change the persona of the bot.")
   @discord_option(
     name="persona",
@@ -172,9 +320,18 @@ async def discord_bot(
     ),
   )
   async def _change_persona(ctx: discord.ApplicationContext, persona: str):
+    # Block until all the backend is setup
+    if not bot_ready.is_set():
+      logger.annoying("Waiting for bot to be ready...")
+      await bot_ready.wait()
     logger.trace(f"Changing persona to {persona}")
     bot_entity.persona = load_persona_from_dir(persona, persona_dir)
     await ctx.respond(f"I have changed my persona to {persona} at {ctx.user.display_name}'s request.")
+    await ctx.respond(
+      f"The Persona is as follows:\n\n{bot_entity.persona}"[:2000],
+      ephemeral=True,
+      delete_after=60,
+    )
 
   @bot.slash_command(name="prompt", help="Test a Persona with a model.")
   @discord_option(
@@ -207,6 +364,10 @@ async def discord_bot(
     model: str,
     personality: str,
   ):
+    # Block until all the backend is setup
+    if not bot_ready.is_set():
+      logger.annoying("Waiting for bot to be ready...")
+      await bot_ready.wait()
     logger.trace(f"{ctx.author.name} has requested a prompt...")
     persona = load_persona_from_dir(persona, persona_dir)
     await ctx.defer(ephemeral=True, invisible=False)
@@ -225,6 +386,11 @@ async def discord_bot(
 
   @bot.slash_command(name="personas", help="List the available personas.")
   async def _personas(ctx: discord.ApplicationContext):
+    # Block until all the backend is setup
+    if not bot_ready.is_set():
+      logger.annoying("Waiting for bot to be ready...")
+      await bot_ready.wait()
+
     logger.trace(f"Listing personas for {ctx.author.name}...")
     personas = list_available_personas(persona_dir)
     msg = "__Available personas:__\n{p}".format(
@@ -241,6 +407,10 @@ async def discord_bot(
     ),
   )
   async def _print_persona(ctx: discord.ApplicationContext, persona: str):
+    # Block until all the backend is setup
+    if not bot_ready.is_set():
+      logger.annoying("Waiting for bot to be ready...")
+      await bot_ready.wait()
     logger.trace(f"Printing persona {persona} for {ctx.author.name}...")
     persona_content = load_persona_from_dir(persona, persona_dir)
     msg = f"__Persona {persona}:__\n{persona_content}"
@@ -253,7 +423,6 @@ async def discord_bot(
     logger.info("Starting Discord Bot...")
     await bot.connect(reconnect=True)
     logger.info("Discord Bot Started.")
-    logger.info("Waiting for instruction to quit...")
   except asyncio.CancelledError:
     logger.warning("Discord Bot Cancelled. Exiting...")
   finally:
@@ -302,6 +471,7 @@ def _parse_kwargs(*args: str, **kwargs: str) -> dict:
     "trace": False,
     "annoy": False,
     "quiet": False,
+    "modules": False,
     "cache": f"{os.environ['CI_PROJECT_DIR']}/meta/chain/",
     "personas": f"{os.environ['CI_PROJECT_DIR']}/meta/personas/",
     "model": "gpt3",
@@ -476,7 +646,7 @@ def _setup_logging(**_kwargs):
       format=custom_fmt,
     )
   
-    if assistant_module_log_level:
+    if _kwargs['modules'] and assistant_module_log_level:
       # Update the assistant module's log level
       assistant_logger = logging.getLogger(assistant._logging_name)
       assistant_logger.setLevel(assistant_module_log_level.value)

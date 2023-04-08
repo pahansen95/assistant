@@ -1,90 +1,16 @@
 """TODO: Add module docstring"""
 import enum
+import logging
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import AsyncIterable, Iterable, NamedTuple, Callable, Any
-import logging
-import copy
+from dataclasses import dataclass
+from typing import (AsyncIterable, Callable, Iterable,
+                    NamedTuple)
 
 import networkx as nx
 
-ANDROGYNOUS_NAMES: tuple[str] = (
-  "Alex",
-  "Avery",
-  "Bailey",
-  "Blair",
-  "Bobby",
-  "Brett",
-  "Brook",
-  "Cameron",
-  "Campbell",
-  "Casey",
-  "Charlie",
-  "Chris",
-  "Dakota",
-  "Dana",
-  "Drew",
-  "Eli",
-  "Elliot",
-  "Emerson",
-  "Finley",
-  "Frankie",
-  "Gale",
-  "Harley",
-  "Hayden",
-  "Hunter",
-  "Jackie",
-  "Jamie",
-  "Jay",
-  "Jesse",
-  "Jordan",
-  "Jules",
-  "Kai",
-  "Kendall",
-  "Kerry",
-  "Kim",
-  "Kris",
-  "Kyle",
-  "Lee",
-  "Logan",
-  "London",
-  "Mackenzie",
-  "Madison",
-  "Max",
-  "Morgan",
-  "Nicky",
-  "Noah",
-  "Parker",
-  "Pat",
-  "Peyton",
-  "Phoenix",
-  "Quinn",
-  "Randy",
-  "Reagan",
-  "Reese",
-  "Riley",
-  "River",
-  "Robin",
-  "Rowan",
-  "Ryan",
-  "Sage",
-  "Sam",
-  "Sandy",
-  "Sawyer",
-  "Shawn",
-  "Sidney",
-  "Sky",
-  "Spencer",
-  "Stevie",
-  "Terry",
-  "Taylor",
-  "Toni",
-  "Tyler",
-  "Val",
-  "Whitney",
-  "Wren"
-)
+from ._misc import *
+
 
 class AssistantError(Exception):
   """Base class for exceptions in this module."""
@@ -387,35 +313,62 @@ class ChatMessage:
   """An immutable message in a chat transcript."""
   content: str
   entity: EntityProperties
+  published: float
 
+@properties_interface_factory(
+  MetaProp(
+    name="conversation",
+    description="The conversation as a directed graph.",
+    _type=nx.DiGraph,
+  ),
+  MetaProp(
+    name="entities",
+    description="The entities that participated in the conversation.",
+    _type=set[EntityProperties],
+  ),
+  MetaProp(
+    name="messages",
+    description="All the conversation's message buffer.",
+    _type=list[ChatMessage],
+  ),
+)
 class TranscriptProperties(ABC):
   """Defines the base set of properties that identify a transcript."""
-  @property
-  @abstractmethod
-  def conversation(self) -> nx.DiGraph:
-    """Returns the conversation as a directed graph."""
-    ...
-  
-  @property
-  @abstractmethod
-  def entities(self) -> set[EntityProperties]:
-    """Returns the entities that participated in the conversation."""
-    ...
-  
-  @property
-  @abstractmethod
-  def messages(self) -> list[ChatMessage]:
-    """Returns all the conversation's message buffer."""
-    ...
 
 class TranscriptInterface(ABC):
   """Defines the interface for recording a conversation as a Directed Graph."""
+
+  @abstractmethod
+  async def __aenter__(self):
+    """Acquire the lock on the transcript."""
+    ...
+  
+  @abstractmethod
+  async def __aexit__(self, exc_type, exc_val, exc_tb):
+    """Release the lock on the transcript."""
+    ...
+
+  @abstractmethod
+  def message_exists(self, msg: ChatMessage) -> bool:
+    """Check if a message exists in the transcript."""
+    ...
+
   @abstractmethod
   def entity_said(
     self,
     entity: EntityProperties,
     said: str,
+    when: float,
     in_response_to: Iterable[ChatMessage] | ChatMessage | None = None,
   ):
     """Record that an entity said something."""
+    ...
+  
+  @abstractmethod
+  def get_message_history(
+    self,
+    msg: ChatMessage,
+    depth: int,
+  ) -> list[ChatMessage]:
+    """Get the message history of a message. The msg is at the end of the list."""
     ...
