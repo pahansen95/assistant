@@ -10,13 +10,13 @@ import os
 import pathlib
 import sys
 import uuid
-from dataclasses import dataclass, field
 from typing import TypeVar
 
 import discord
 from discord.commands import option as discord_option
 from discord.ext import commands
 from loguru import logger
+import loguru._recattrs
 
 import assistant
 import assistant.entity as entity
@@ -28,34 +28,21 @@ _user_msg = lambda p: assistant.PromptMessage(p, assistant.PROMPT_MESSAGE_ROLE.U
 _system_msg = lambda p: assistant.PromptMessage(p, assistant.PROMPT_MESSAGE_ROLE.SYSTEM)
 _assistant_msg = lambda p: assistant.PromptMessage(p, assistant.PROMPT_MESSAGE_ROLE.ASSISTANT)
 
-### Add logging to the assistant module & PyCord
-class LoguruLogger(assistant._LoggingInterface):
-  """Log using Loguru"""
-  async def __call__(self, msg: str, level: str):
-    # Ordered by what I think is most common to least common
-    if level == "trace":
-      logger.trace(msg)
-    elif level == "debug":
-      logger.debug(msg)
-    elif level == "info":
-      logger.level(msg)
-    elif level == "error":
-      logger.error(msg)
-    elif level == "warning":
-      logger.warning(msg)
-    elif level == "success":
-      logger.success(msg)
-    elif level in ["fatal", "critical"]:
-      logger.critical(msg)
-    else:
-      RuntimeError(f"Unknown log level {level}.")
-assistant.set_logger(LoguruLogger())
-class InterceptHandler(logging.Handler):
-  def emit(self, record):
-    logger_opt = logger.opt(depth=6, exception=record.exc_info)
-    logger_opt.log(record.levelno, record.getMessage())
-# logging.basicConfig(handlers=[InterceptHandler()], level=0)
-###
+def _log_record_with_loguru(record: logging.LogRecord):
+  """A callback function for the logging handler."""
+  # frame, depth = logging.currentframe(), 2
+  # while frame.f_code.co_filename == logging.__file__:
+  #   frame = frame.f_back
+  #   depth += 1
+  # depth += 1
+  # print(depth) # 8
+  logger.opt(
+    depth=8,
+    exception=record.exc_info,
+  ).log(
+    f"USER_{assistant._MODULE_LOG_LEVELS(record.levelno).name.upper()}",
+    record.getMessage(),
+  )
 
 def load_persona_from_dir(name: str, dir: str) -> str:
   """Loads a persona from a file."""
@@ -100,8 +87,9 @@ async def discord_bot(
   bot_token = os.environ["DISCORD_BOT_TOKEN"]
   
   bot_entity = entity.Entity(
-    uuid=uuid.uuid4(),
-    name="Jack",
+    _uuid=uuid.uuid4(),
+    _name="Jack",
+    _description="A bot that uses GPT to chat with you.",
     _send=model_interface,
     persona=load_persona_from_dir("jack-of-all-trades", persona_dir),
   )
@@ -136,10 +124,22 @@ async def discord_bot(
   @bot.event
   async def on_ready():
     logger.success(f"Logged in as {bot.user.name} ({bot.user.id})")
+    await bot.change_presence(
+      status=discord.Status.online,
+    )
+  
+  @bot.event
+  async def on_disconnect():
+    logger.warning("Disconnected from Discord.")
 
   @bot.event
   async def on_message(message: discord.Message):
-    if message.author == bot.user:
+
+    # Don't respond to ourselves or other bots (for now as a failsafe)
+    if (
+      (message.author == bot.user) or
+      (message.author.bot)
+    ):
       return
     
     if message.mentions and bot.user in message.mentions:
@@ -258,6 +258,11 @@ async def discord_bot(
     logger.warning("Discord Bot Cancelled. Exiting...")
   finally:
     logger.info("Stopping Discord Bot...")
+    # Attempt to let users know we'll be right back
+    bot.description = "I'll be right back!"
+    await bot.change_presence(
+      status=discord.Status.offline,
+    )
     if not bot.is_closed(): 
       await bot.close()
     logger.info("Discord Bot Stopped.")
@@ -293,6 +298,10 @@ def _parse_kwargs(*args: str, **kwargs: str) -> dict:
   _kwargs = {
     "help": False,
     "verbose": False,
+    "debug": False,
+    "trace": False,
+    "annoy": False,
+    "quiet": False,
     "cache": f"{os.environ['CI_PROJECT_DIR']}/meta/chain/",
     "personas": f"{os.environ['CI_PROJECT_DIR']}/meta/personas/",
     "model": "gpt3",
@@ -344,16 +353,144 @@ Subcommands:
         The guild ids to run the bot in. Defaults to 1093645046986850346.
   """)
 
+def _setup_logging(**_kwargs):
+  # Set custom log levels w/ loguru. We'll use the same levels as the assistant package
+  # The lower the lever, the less important the message is.
+  # Lower levels should have duller colors & higher levels should have brighter colors.
+  pallete = {
+    "red": 0xcc0000,
+    "green": 0x00cc00,
+    "blue": 0x0000cc,
+    "yellow": 0xcccc00,
+    "cyan": 0x00cccc,
+    "magenta": 0xcc00cc,
+    "white": 0xcccccc,
+    "black": 0x000000,
+    "light-gray": 0xeeeeee,
+    "gray": 0xbcbcbc,
+    "dark-gray": 0x999999,
+  }
+  fmt_color = lambda c='white', b=True, u=False: f"<fg #{pallete[c.lower()]:06x}>{'<b>' if b else ''}{'<u>' if u else ''}"
+  # Update loguru's log levels
+  logger.level(
+    name="USER_CRITICAL",
+    no=assistant._MODULE_LOG_LEVELS.CRITICAL.value,
+    color=fmt_color(c="red"),
+    icon="💀",
+  )
+  logger.level(
+    name="USER_ERROR",
+    no=assistant._MODULE_LOG_LEVELS.ERROR.value,
+    color=fmt_color(c="red"),
+    icon="‼️"
+  )
+  logger.level(
+    name="USER_SUCCESS",
+    no=assistant._MODULE_LOG_LEVELS.SUCCESS.value,
+    color=fmt_color(c="green"),
+    icon="✅"
+  )
+  logger.level(
+    name="USER_WARNING",
+    no=assistant._MODULE_LOG_LEVELS.WARNING.value,
+    color=fmt_color(c="yellow"),
+    icon="⚠️"
+  )
+  logger.level(
+    name="USER_INFO",
+    no=assistant._MODULE_LOG_LEVELS.INFO.value,
+    color=fmt_color(c="white"),
+    icon="❕"
+  )
+  logger.level(
+    name="USER_DEBUG",
+    no=assistant._MODULE_LOG_LEVELS.DEBUG.value,
+    color=fmt_color(c="light-gray", b=False),
+    icon="🐛"
+  )
+  logger.level(
+    name="USER_TRACE",
+    no=assistant._MODULE_LOG_LEVELS.TRACE.value,
+    color=fmt_color(c="gray", b=False),
+    icon="🐞"
+  )
+  logger.level(
+    name="USER_ANNOYING",
+    no=assistant._MODULE_LOG_LEVELS.ANNOYING.value,
+    color=fmt_color(c="dark-gray", b=False),
+    icon="💤"
+  )
+  # Update loguru's log level shortcuts
+  logger.annoying = lambda msg, *args, **kwargs: logger.log("USER_ANNOYING", msg)
+  logger.annoy = lambda msg, *args, **kwargs: logger.log("USER_ANNOYING", msg)
+  logger.trace = lambda msg, *args, **kwargs: logger.log("USER_TRACE", msg)
+  logger.debug = lambda msg, *args, **kwargs: logger.log("USER_DEBUG", msg)
+  logger.info = lambda msg, *args, **kwargs: logger.log("USER_INFO", msg)
+  logger.warning = lambda msg, *args, **kwargs: logger.log("USER_WARNING", msg)
+  logger.warn = lambda msg, *args, **kwargs: logger.log("USER_WARNING", msg)
+  logger.error = lambda msg, *args, **kwargs: logger.log("USER_ERROR", msg)
+  logger.success = lambda msg, *args, **kwargs: logger.log("USER_SUCCESS", msg)
+  logger.critical = lambda msg, *args, **kwargs: logger.log("USER_CRITICAL", msg)
+  logger.fatal = lambda msg, *args, **kwargs: logger.log("USER_CRITICAL", msg)
+  
+  ### Patch Loguru's RecordLevel to strip the `USER_` prefix
+  def _patched_init(self, name: str, no: int, icon: str):
+    self.name = name.removeprefix("USER_")
+    self.no = no
+    self.icon = icon
+  setattr(
+    loguru._recattrs.RecordLevel,
+    "__init__",
+    _patched_init,
+  )
+  ###
+
+  # Set the log levels
+  script_log_level = assistant._MODULE_LOG_LEVELS.WARNING
+  assistant_module_log_level = None
+  if _kwargs["verbose"]:
+    script_log_level=assistant._MODULE_LOG_LEVELS.INFO
+    assistant_module_log_level = assistant._MODULE_LOG_LEVELS.INFO
+  elif _kwargs["debug"]:
+    script_log_level=assistant._MODULE_LOG_LEVELS.DEBUG
+    assistant_module_log_level = assistant._MODULE_LOG_LEVELS.DEBUG
+  elif _kwargs["trace"]:
+    script_log_level=assistant._MODULE_LOG_LEVELS.TRACE
+    assistant_module_log_level = assistant._MODULE_LOG_LEVELS.TRACE
+  elif _kwargs["annoy"]:
+    script_log_level=assistant._MODULE_LOG_LEVELS.ANNOYING
+    assistant_module_log_level = assistant._MODULE_LOG_LEVELS.ANNOYING
+  
+  if not _kwargs["quiet"]:
+    # Custome logger based off the loguru default
+    custom_fmt = (
+      "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+      "<level>{level: ^10}</level> | "
+      "{level.icon: ^2} | "
+      "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+    )
+    
+    logger.add(
+      sys.stderr,
+      level=f"USER_{script_log_level.name.upper()}",
+      format=custom_fmt,
+    )
+  
+    if assistant_module_log_level:
+      # Update the assistant module's log level
+      assistant_logger = logging.getLogger(assistant._logging_name)
+      assistant_logger.setLevel(assistant_module_log_level.value)
+      assistant_logger.addHandler(
+        assistant._CallbackHandler(_log_record_with_loguru)
+      )
+    
 if __name__ == "__main__":
   _rc = 255
   try:
     logger.remove()
     _args = _parse_args(*sys.argv[1:])
     _kwargs = _parse_kwargs(*sys.argv[1:])
-    if _kwargs["verbose"]:
-      logger.add(sys.stderr, level="TRACE")
-    else:
-      logger.add(sys.stderr, level="INFO")
+    _setup_logging(**_kwargs)
     if _kwargs["help"]:
       _help()
       _rc = 0

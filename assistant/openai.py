@@ -45,7 +45,7 @@ async def count_tokens(model: str, *messages: str):
   try:
     encoding = tiktoken.encoding_for_model(model)
   except KeyError:
-    await _logger.warning(f"Model {model} not found in TikToken. Using default encoding.")
+    _logger.warning(f"Model {model} not found in TikToken. Using default encoding.")
     encoding = tiktoken.get_encoding("cl100k_base")
   
   return len(encoding.encode(
@@ -58,15 +58,15 @@ async def _streaming_watchdog(
   chunk_recieved: asyncio.Event,
 ) -> None:
   """Waits for a chunk to be recieved before timing out."""
-  await _logger.trace("Starting OpenAI Streaming API watchdog...")
+  _logger.trace("Starting OpenAI Streaming API watchdog...")
   try:
     while True:
       await asyncio.wait_for(chunk_recieved.wait(), timeout)
       chunk_recieved.clear()
   except asyncio.CancelledError:
-    await _logger.trace("OpenAI Streaming API watchdog cancelled. Stopping watchdog...")
+    _logger.trace("OpenAI Streaming API watchdog cancelled. Stopping watchdog...")
   except asyncio.TimeoutError:
-    await _logger.warning("OpenAI Streaming API timed out. Cancelling stream...")
+    _logger.warning("OpenAI Streaming API timed out. Cancelling stream...")
     cancel_task.cancel()
 
 async def _safe_stream(
@@ -74,17 +74,17 @@ async def _safe_stream(
   **acreate_kwargs,
 ) -> AsyncGenerator[str, None]:
   """Uses the streaming protocol w/ openAI to avoid hanging requests."""
-  await _logger.trace("Starting streaming API request...")
+  _logger.trace("Starting streaming API request...")
   acreate_kwargs.pop("stream", None)
-  await _logger.trace("Acquiring a spot in the api call queue...")
+  _logger.trace("Acquiring a spot in the api call queue...")
   async with max_openai_api_calls:
-    await _logger.trace("Acquired a spot in the api call queue. Calling the API...")
+    _logger.trace("Acquired a spot in the api call queue. Calling the API...")
     streaming_response = await openai.ChatCompletion.acreate(
       stream=True,
       **acreate_kwargs,
     )
     try:
-      await _logger.trace("Streaming API request started. Starting watchdog...")
+      _logger.trace("Streaming API request started. Starting watchdog...")
       chunk_recieved = asyncio.Event()
       watchdog_task = asyncio.create_task(
         _streaming_watchdog(
@@ -94,7 +94,7 @@ async def _safe_stream(
         )
       )
       try:
-        await _logger.trace("Watchdog scheduled. Streaming chunks...")
+        _logger.trace("Watchdog scheduled. Streaming chunks...")
         async for chunk in streaming_response:
           # TODO: Support multiple choices
           if chunk["choices"][0]["delta"] != {}:
@@ -109,21 +109,21 @@ async def _safe_stream(
           if chunk["choices"][0]["finish_reason"] == None:
             continue
           elif chunk['choices'][0]['finish_reason'] == 'stop':
-            await _logger.trace("OpenAI Streaming API finished. Stopping stream...")
+            _logger.trace("OpenAI Streaming API finished. Stopping stream...")
             break
           else:
             raise ResponseIncomplete(chunk['choices'][0]['finish_reason'])
       except asyncio.CancelledError:
-        await _logger.warning("OpenAI Streaming API cancelled. Stopping stream...")
+        _logger.warning("OpenAI Streaming API cancelled. Stopping stream...")
     finally:
-      await _logger.trace("Stopping watchdog...")
+      _logger.trace("Stopping watchdog...")
       watchdog_task.cancel()
-      await _logger.trace("Closing streaming API request...")
+      _logger.trace("Closing streaming API request...")
       try:
         await streaming_response.aclose()
       except:
         pass
-      await _logger.trace("Waiting for watchdog to stop...")
+      _logger.trace("Waiting for watchdog to stop...")
       await watchdog_task
 
 @dataclass
@@ -149,7 +149,7 @@ class OpenAIChatCompletion(PromptInterface):
     personality: PROMPT_PERSONALITY,
   ) -> AsyncIterable[str]:
     """Asynchronously prompt the LLM for a response. Streams the response. Can't retry a stream. Use `__call__` instead."""
-    await _logger.trace(f"Streaming response from {model} with personality {personality}...")
+    _logger.trace(f"Streaming response from {model} with personality {personality}...")
     _msgs = [
       {
         "content": msg.content,
@@ -161,14 +161,14 @@ class OpenAIChatCompletion(PromptInterface):
     if total_tokens <= self.model_lookup[model]['max_tokens'] // 2:
       pass
     elif total_tokens > self.model_lookup[model]['max_tokens'] // 2:
-      await _logger.warning(f"Prompt exceeds 50% of maximum number of tokens for model {model}.")
+      _logger.warning(f"Prompt exceeds 50% of maximum number of tokens for model {model}.")
     elif total_tokens >= int(9 * self.model_lookup[model]['max_tokens'] / 10):
-      await _logger.warning(f"Prompt exceeds 90% the number of tokens for model {model}.")
+      _logger.warning(f"Prompt exceeds 90% the number of tokens for model {model}.")
     elif total_tokens >= self.model_lookup[model]['max_tokens']:
-      await _logger.error(f"Prompt exceeds maximum number of tokens for model {model}.")
+      _logger.error(f"Prompt exceeds maximum number of tokens for model {model}.")
       raise RuntimeError(f"Prompt exceeds maximum number of tokens for model {model}.")
 
-    await _logger.trace(f"Starting stream...")
+    _logger.trace(f"Starting stream...")
     async for response in _safe_stream(
       chunk_timeout=1, # Chunks should be recieved within milliseconds
       model=self.model_lookup[model]["name"],
@@ -185,10 +185,10 @@ class OpenAIChatCompletion(PromptInterface):
     max_retry_count: int = 3
   ) -> str:
     """Asynchronously prompt the LLM for a response. Returns the response."""
-    await _logger.info(f"Prompting {model} with {personality.value} personality...")
+    _logger.info(f"Prompting {model} with {personality.value} personality...")
     retry_count = 0
     while True:
-      await _logger.trace(f"Attempt {retry_count}/{max_retry_count}...")
+      _logger.trace(f"Attempt {retry_count}/{max_retry_count}...")
       try:
         response = ""
         chunk_generator = self.__aiter__(messages, model, personality)
@@ -199,5 +199,5 @@ class OpenAIChatCompletion(PromptInterface):
         if retry_count >= max_retry_count:
           raise
         retry_count += 1
-        await _logger.warning(f"Retrying Prompt {retry_count}/{max_retry_count}...")
+        _logger.warning(f"Retrying Prompt {retry_count}/{max_retry_count}...")
         continue

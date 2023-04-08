@@ -1,24 +1,31 @@
-from . import _logger, PromptInterface, PROMPT_PERSONALITY, PROMPT_MESSAGE_ROLE, PromptMessage
+from . import _logger, PromptInterface, PROMPT_PERSONALITY, PROMPT_MESSAGE_ROLE, PromptMessage, EntityProperties, EntityInterface
 from dataclasses import dataclass, field, KW_ONLY
 import uuid
 from typing import Iterable, Any
- 
+
 @dataclass
-class Entity:
+class Entity(EntityProperties.PropsMixin, EntityProperties, EntityInterface):
   """A Contributor to a Conversation. key & persona are optional & don't contribute the entity's identity."""
-  uuid: uuid.UUID
-  """The UUID of the entity."""
-  name: str
+  _name: str
   """The name of the entity."""
+  _description: str
+  """The description of the entity."""
+  _uuid: uuid.UUID
+  """The UUID of the entity."""
   _send: PromptInterface
   """The interface to the LLM that the entity uses to prompt for a response."""
   _: KW_ONLY
-  key: tuple[str, ...] | None = field(default=None)
+  key: tuple[str, ...] | None = field(default=None, kw_only=True)
   """An optional set of strings that uniquely describe the entity's persona"""
-  persona: str | None = field(default=None)
+  persona: str | None = field(default=None, kw_only=True)
   """The optional persona of the entity. Who is this entity, what are their capabilities, etc..."""
-  context: list[str] = field(default_factory=list)
+  context: list[str] = field(default_factory=list, kw_only=True)
   """Any contextal information that the entity should track; this is akin to short term memory."""
+
+  def __post_init__(self):
+    _logger.debug(f"{self.name=}")
+    _logger.debug(f"{self.description=}")
+    _logger.debug(f"{self.uuid=}")
 
   def __hash__(self) -> int:
     return hash((self.uuid.hex, self.name))
@@ -64,7 +71,7 @@ class Entity:
       model=model,
       personality=responding_personality,
     )
-    await _logger.trace(f"Entities {self.name} initial response: {initial_response}")
+    _logger.trace(f"Entities {self.name} initial response: {initial_response}")
     # Let the entity think about it's response
     # reflective_thought = "Here is the conversation you are replying to:\n{conversation}You want to respond with: {response}. How could you improve your response? ".format(
     #   response=initial_response,
@@ -81,7 +88,7 @@ class Entity:
       model=model,
       thinking_personality=reflection_personality,
     )
-    await _logger.trace(f"Entities {self.name} reflection on it's thought: {reflection}")
+    _logger.trace(f"Entities {self.name} reflection on it's thought: {reflection}")
     # Generate another response incorporating the reflection
     revised_response = await self._send(
       messages=[
@@ -99,7 +106,7 @@ class Entity:
       model=model,
       personality=responding_personality,
     )
-    await _logger.trace(f"Entities {self.name} revised response: {revised_response}")
+    _logger.trace(f"Entities {self.name} revised response: {revised_response}")
     # TODO: Add Heuristics to determine if the response is any good
     return revised_response
   
@@ -126,7 +133,7 @@ class Entity:
       role=PROMPT_MESSAGE_ROLE.ASSISTANT,
     )
     # generate an initial thought
-    await _logger.trace(f"Entity: {self.name} is thinking about: {thought}")
+    _logger.trace(f"Entity: {self.name} is thinking about: {thought}")
     initial_thought = await self._send(
       messages=[
         _user_msg(f"# This is your persona\n{self.persona}"),
@@ -137,7 +144,7 @@ class Entity:
       model=model,
       personality=thinking_personality,
     )
-    await _logger.trace(f"Entity {self.name} is reflecting on it's thought: {initial_thought}")
+    _logger.trace(f"Entity {self.name} is reflecting on it's thought: {initial_thought}")
     # conduct a challenge session
     challenge_session = await self._send(
       messages=[
@@ -151,7 +158,7 @@ class Entity:
       model=model,
       personality=thinking_personality,
     )
-    await _logger.trace(f"Entity {self.name} is challenging it's thoughts: {challenge_session}")
+    _logger.trace(f"Entity {self.name} is challenging it's thoughts: {challenge_session}")
     # reflect on the challenge session & iterate on the initial thought
     reflection = await self._send(
       messages=[
@@ -167,7 +174,7 @@ class Entity:
       model=model,
       personality=thinking_personality,
     )
-    await _logger.trace(f"Entity {self.name} summarized it's thought as: {reflection}")
+    _logger.trace(f"Entity {self.name} summarized it's thought as: {reflection}")
     return reflection
 
   def to_dict(self):

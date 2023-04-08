@@ -1,7 +1,13 @@
 """TODO: Add module docstring"""
 import enum
+import uuid
 from abc import ABC, abstractmethod
-from typing import AsyncIterable, Iterable, NamedTuple
+from dataclasses import dataclass, field
+from typing import AsyncIterable, Iterable, NamedTuple, Callable, Any
+import logging
+import copy
+
+import networkx as nx
 
 ANDROGYNOUS_NAMES: tuple[str] = (
   "Alex",
@@ -80,44 +86,185 @@ ANDROGYNOUS_NAMES: tuple[str] = (
   "Wren"
 )
 
-
 class AssistantError(Exception):
   """Base class for exceptions in this module."""
   pass
 
-class _LoggingInterface(ABC):
-  """A placeholder for the logging function"""
-  async def fatal(self, msg: str):
-    await self(msg=msg, level="fatal")
-  async def critical(self, msg: str):
-    await self(msg=msg, level="critical")
-  async def error(self, msg: str):
-    await self(msg=msg, level="error")
-  async def success(self, msg: str):
-    await self(msg=msg, level="success")
-  async def warning(self, msg: str):
-    await self(msg=msg, level="warning")
-  async def info(self, msg: str):
-    await self(msg=msg, level="info")
-  async def debug(self, msg: str):
-    await self(msg=msg, level="debug")
-  async def trace(self, msg: str):
-    await self(msg=msg, level="trace")
-  @abstractmethod
-  async def __call__(self, msg: str, level: str):
-    ...
+class _CallbackHandler(logging.Handler):
+  """A logging handler that hands off the log message to a callback"""
+  def __init__(
+    self,
+    callback: Callable[[logging.LogRecord], None]
+  ):
+    super().__init__()
+    self.callback = callback
 
-class _DummyLogger(_LoggingInterface):
-  """A dummy logger that does nothing"""
-  async def __call__(self, msg: str, level: str):
-    pass
+  def emit(self, record: logging.LogRecord):
+    self.callback(record)
 
-_logger = _DummyLogger()
+class _MODULE_LOG_LEVELS(enum.IntEnum):
+  """The logging levels for the assistant module"""
+  ANNOYING = 1
+  TRACE = 5
+  DEBUG = 10
+  INFO = 20
+  WARNING = 30
+  ERROR = 40
+  SUCCESS = 40
+  CRITICAL = 50
+  FATAL = 50
 
-def set_logger(logger: _LoggingInterface):
-  """Sets the logger to use for logging"""
-  global _logger
-  _logger = logger
+@dataclass
+class _ModuleLogger:
+  logger: logging.Logger
+  level: _MODULE_LOG_LEVELS
+
+  def __post_init__(self):
+    self.logger.setLevel(self.level.value)
+  
+  def annoying(self, msg: str):
+    self.logger.log(_MODULE_LOG_LEVELS.ANNOYING.value, msg)
+  annoy = annoying
+  
+  def trace(self, msg: str):
+    self.logger.log(_MODULE_LOG_LEVELS.TRACE.value, msg)
+  
+  def debug(self, msg: str):
+    self.logger.log(_MODULE_LOG_LEVELS.DEBUG.value, msg)
+  
+  def info(self, msg: str):
+    self.logger.log(_MODULE_LOG_LEVELS.INFO.value, msg)
+
+  def warning(self, msg: str):
+    self.logger.log(_MODULE_LOG_LEVELS.WARNING.value, msg)
+  warn = warning
+    
+  def error(self, msg: str):
+    self.logger.log(_MODULE_LOG_LEVELS.ERROR.value, msg)
+
+  def success(self, msg: str):
+    self.logger.log(_MODULE_LOG_LEVELS.SUCCESS.value, msg)
+
+  def critical(self, msg: str):
+    self.logger.log(_MODULE_LOG_LEVELS.CRITICAL.value, msg)
+
+  def fatal(self, msg: str):
+    self.logger.log(_MODULE_LOG_LEVELS.FATAL.value, msg)
+
+_logging_name = "assistant"
+_logger = _ModuleLogger(
+  logger=logging.getLogger(_logging_name), # an empty logger
+  level=_MODULE_LOG_LEVELS.ANNOYING,
+)
+# _logger.trace("TEST TRACE")
+# _logger.critical("TEST CRITICAL")
+# _logger.logger.addHandler(
+#   _CallbackHandler(
+#     callback=lambda record: print(f"MODULE DEVELOPMENT::{_MODULE_LOG_LEVELS(record.levelno).name.upper()}::{record.msg}", flush=True)
+#   )
+# )
+
+@dataclass(frozen=True)
+class MetaProp:
+  name: str
+  description: str
+  _type: type
+  immutable: bool = False
+
+def properties_interface_factory(
+  *props: MetaProp,
+) -> Callable[[type], type]:
+  """A Class decorator that injects into an abstract base class:
+    - Abstract Getters & Setters for each property
+    - A Mixin class that is a convenience for implementing the abstract base class
+  """
+  _logger.trace(f"Creating properties interface for {props}")
+  # Assert there are no duplicate property names
+  assert len(props) == len(set(prop.name for prop in props)), "Duplicate property names"
+  
+  def _abstract_getter(self):
+    raise NotImplementedError("Abstract property getter not implemented")
+  
+  def _abstract_setter(self, value):
+    raise NotImplementedError("Abstract property setter not implemented")
+    
+  def _getter_factory(_prop_name: str):
+    _logger.trace(f"Creating getter for {_prop_name}")
+    def _getter(self):
+      _logger.annoy(f"Getting property {_prop_name}")
+      return getattr(
+        self,
+        f"_{_prop_name}"
+      )
+    return _getter
+
+  def _setter_factory(_prop_name: str):
+    _logger.trace(f"Creating setter for {_prop_name}")
+    def _setter(self, value):
+      _logger.annoy(f"Setting property {_prop_name}")
+      setattr(
+        self,
+        f"_{_prop_name}",
+        value
+      )
+    return _setter
+  
+  def _inject_property_interface(abc_class: type) -> type:
+    # Check that the class is an ABC
+    _logger.trace(f"Injecting properties into {abc_class.__name__}")
+    if not issubclass(abc_class, ABC):
+      raise TypeError(f"{abc_class} is not an ABC")
+    
+    for prop_def in props:      
+      # Inject the property into the ABC Class
+      setattr(
+        abc_class,
+        prop_def.name,
+        property(
+          fget=_abstract_getter,
+          fset=_abstract_setter if not prop_def.immutable else None,
+          doc=prop_def.description,
+        )
+      )
+
+      # Set the type hint
+      abc_class.__annotations__[prop_def.name] = prop_def._type
+    
+    # Create the Mixin subclass
+    mixin_class = type(
+      f"{abc_class.__name__}PropsMixin",
+      (),
+      {},
+    )
+
+    # Inject the properties into the Mixin
+    for prop_def in props:
+      # Inject the property into the Mixin
+      setattr(
+        mixin_class,
+        prop_def.name,
+        property(
+          fget=_getter_factory(prop_def.name),
+          fset=_setter_factory(prop_def.name) if not prop_def.immutable else None,
+          doc=prop_def.description,
+        )
+      )
+
+      # Set the type hint
+      mixin_class.__annotations__[prop_def.name] = prop_def._type
+
+    # Inject the Mixin into the ABC
+    setattr(
+      abc_class,
+      "PropsMixin",
+      mixin_class,
+    )
+    _logger.debug("Returning property Abstract Class")
+    return abc_class
+  
+  _logger.debug("Returning property interface factory")
+  return _inject_property_interface
+
 
 class PROMPT_MESSAGE_ROLE(enum.Enum):
   USER = "user"
@@ -180,3 +327,95 @@ class ResponseIncomplete(AssistantError):
   """Raised when the LLM returns an incomplete response."""
   def __init__(self, reason: str):
     self.reason = reason
+
+_logger.trace("Creating properties interface for EntityProperties")
+@properties_interface_factory(
+  MetaProp(
+    name="name",
+    description="The name of the entity",
+    _type=str,
+    immutable=True,
+  ),
+  MetaProp(
+    name="description",
+    description="The description of the entity",
+    _type=str,
+    immutable=True,
+  ),
+  MetaProp(
+    name="uuid",
+    description="The UUID of the entity",
+    _type=uuid.UUID,
+    immutable=True,
+  ),
+)
+class EntityProperties(ABC):
+  """Defines the base set of properties that identify an entity."""
+  
+  def __hash__(self) -> int:
+    """A hash of the entity properties to use in things such as set operations."""
+    return hash(self.name, self.uuid.bytes)
+
+
+class EntityInterface(ABC):
+  """Defines the interface for an entity."""
+  @abstractmethod
+  async def think(
+    self,
+    idea: str,
+    context: Iterable[str],
+    model: str,
+    thinking_personality: str,
+  ) -> str:
+    """The entity reflects on a thought seeking to improve it."""
+    ...
+  
+  @abstractmethod
+  async def respond(
+    self,
+    chat: Iterable[str],
+    context: Iterable[str],
+    model: str,
+    responding_personality: str,
+    reflection_personality: str,
+  ) -> str:
+    """Respond to the chat. The entity will think of a response, reflect on it & then respond accordingly."""
+    ...
+  
+@dataclass(frozen=True)
+class ChatMessage:
+  """An immutable message in a chat transcript."""
+  content: str
+  entity: EntityProperties
+
+class TranscriptProperties(ABC):
+  """Defines the base set of properties that identify a transcript."""
+  @property
+  @abstractmethod
+  def conversation(self) -> nx.DiGraph:
+    """Returns the conversation as a directed graph."""
+    ...
+  
+  @property
+  @abstractmethod
+  def entities(self) -> set[EntityProperties]:
+    """Returns the entities that participated in the conversation."""
+    ...
+  
+  @property
+  @abstractmethod
+  def messages(self) -> list[ChatMessage]:
+    """Returns all the conversation's message buffer."""
+    ...
+
+class TranscriptInterface(ABC):
+  """Defines the interface for recording a conversation as a Directed Graph."""
+  @abstractmethod
+  def entity_said(
+    self,
+    entity: EntityProperties,
+    said: str,
+    in_response_to: Iterable[ChatMessage] | ChatMessage | None = None,
+  ):
+    """Record that an entity said something."""
+    ...
