@@ -3,6 +3,10 @@ from dataclasses import dataclass, field, KW_ONLY
 import uuid
 from typing import Iterable, Any
 
+_user_msg = lambda content: PromptMessage(content=content, role=PROMPT_MESSAGE_ROLE.USER)
+_assistant_msg = lambda content: PromptMessage(content=content, role=PROMPT_MESSAGE_ROLE.ASSISTANT)
+_system_msg = lambda content: PromptMessage(content=content, role=PROMPT_MESSAGE_ROLE.SYSTEM)
+
 @dataclass
 class ExternalEntity(EntityProperties.PropsMixin, EntityProperties):
   """An external user is an entity that we don't control. We can only responde to them."""
@@ -47,11 +51,47 @@ class InternalEntity(EntityProperties.PropsMixin, EntityProperties, EntityInterf
 
   def __hash__(self) -> int:
     return hash((self.uuid.hex, self.name))
-  
-  def render_context(self) -> str:
-    return "# You remember the following\n{context}".format(
-      context="\n".join(f"- {c}" for c in self.context)
+    
+  def render_iterable(self, header: str, iterable: Iterable[str]) -> str:
+    """Convience function for rendering an iterable into a single string"""
+    _header = ""
+    if header:
+      _header += f"# {header}\n"
+    return "{header}{context}\n".format(
+      header=_header,
+      context="\n".join(f"{c}" for c in iterable)
     )
+
+  def render_prompt(
+    self,
+    chat: Iterable[str],
+    context: Iterable[str],
+  ) -> list[PromptMessage]:
+    """Convience function for rendering the prompt for submission to the model"""
+    assert len(chat) > 0, "Chat must have at least one message"
+    assert isinstance(chat, list), "Chat must be a list"
+    assert all(isinstance(msg, str) for msg in chat), "Chat must be a list of strings"
+    assert isinstance(context, list), "Context must be a list"
+    assert all(isinstance(msg, str) for msg in context), "Context must be a list of strings"
+    return [
+      msg
+      for msg in [
+        _user_msg(f"Your name is {self.name}") if self.name is not None else None,
+        _user_msg(self.persona) if self.persona is not None else None,
+        _user_msg(self.render_iterable(
+          "Here is relevant information to the conversation",
+          self.context,
+        )) if len(self.context) > 0 else None,
+        _user_msg(self.render_iterable(
+          "Here are immediate observations you have made",
+          context,
+        )) if len(context) > 0 else None,
+        _user_msg(self.render_iterable(
+          "Here is the most recent conversation transcript",
+          chat,
+        )),
+      ] if msg is not None
+    ]
 
   async def thoughts_on(
     self,
@@ -72,7 +112,7 @@ class InternalEntity(EntityProperties.PropsMixin, EntityProperties, EntityInterf
   ) -> str:
     """The entity replies to a specific message without any internal reflection. (aka single-shot)"""
     raise NotImplementedError
-  
+    
   async def respond(
     self,
     chat: Iterable[str],
@@ -90,49 +130,31 @@ class InternalEntity(EntityProperties.PropsMixin, EntityProperties, EntityInterf
     - Chat Transcript (in order provided) (`chat` should be ordered with the oldest message first)
     """
     assert len(chat) > 0, "Chat must have at least one message"
-    _logger.debug(f"Entity {self.name} has been asked to respond to the following chat\n{chat[-1]}")
-    _logger.trace("Entity {self.name} has the following chat history\n{chat_history}".format(
-      self=self,
-      chat_history='\n'.join(
-        f'## {i} Chat{"s" if i > 1 else ""} ago\n{c}\n'
-        for i, c in enumerate(list(reversed(chat))[1:], start=2)
-      ),
-    ))
-    _logger.trace(f"Entity {self.name} has the following internal context\n{self.render_context()}")
-    _logger.trace("Entity {self.name} has the following environmental context\n{context}".format(
-      self=self,
-      context='\n'.join(
-        f'## Context {i}\n{c}\n'
-        for i, c in enumerate(context)
-      ),
-    ))
-    _logger.trace(f"Entity {self.name} has the following persona\n{self.persona}")
-    _logger.trace(f"Entity {self.name} is using the following model\n{model}")
-    _user_msg = lambda content: PromptMessage(
-      content=content,
-      role=PROMPT_MESSAGE_ROLE.USER,
+    assert isinstance(chat, list), "Chat must be a list"
+    assert all(isinstance(msg, str) for msg in chat), "Chat must be a list of strings"
+    assert isinstance(context, list), "Context must be a list"
+    assert all(isinstance(msg, str) for msg in context), "Context must be a list of strings"
+    rendered_prompt = self.render_prompt(
+      chat=chat,
+      context=context,
     )
+    _logger.debug(f"Entity {self.name} has been asked to respond to the following chat\n{chat[-1]}")
+    _logger.trace("Entity {self.name}: render_prompt()\n{prompt}".format(
+      self=self,
+      prompt='\n'.join(rp.content for rp in rendered_prompt),
+    ))    
+    
+    # Think
+    
     # Entity will come up with a response
     initial_response = await self._send(
-      messages=[
-        msg
-        for msg in [
-          _user_msg(f"Your name is {self.name}") if self.name is not None else None,
-          _user_msg(f"# This is your persona\n{self.persona}") if self.persona is not None else None,
-          _user_msg(self.render_context()) if len(self.context) > 0 else None,
-          _user_msg("# Here are observations you have made\n{context}".format(context='\n'.join(f'- {c}' for c in context))) if len(context) > 0 else None,
-          _user_msg("# Here is the conversation so far\n"),
-          *[
-            _user_msg(c)
-            for c in chat
-          ],
-        ] if msg is not None
-      ],
+      messages=rendered_prompt,
       model=model,
       personality=responding_personality,
     )
     _logger.debug(f"Entity {self.name} initial response\n{initial_response}")
     return initial_response
+
     # Let the entity think about it's response
     # reflective_thought = "Here is the conversation you are replying to:\n{conversation}You want to respond with: {response}. How could you improve your response? ".format(
     #   response=initial_response,
@@ -180,7 +202,7 @@ class InternalEntity(EntityProperties.PropsMixin, EntityProperties, EntityInterf
     model: str,
     thinking_personality: str,
   ) -> str:
-    """The entity reflects on a thought seeking to improve it.
+    """The entity reflects on the content of an idea to better understand it or.
     The Entity references the following:
       - It's Persona
       - It's internal context (ie. `entity.context`)

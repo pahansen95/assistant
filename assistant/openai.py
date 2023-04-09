@@ -40,7 +40,7 @@ OPENAI_MODEL_LOOKUP = {
 
 max_openai_api_calls = asyncio.Semaphore(10)
 
-async def count_tokens(model: str, *messages: str):
+def count_tokens(model: str, *messages: str):
   """Returns the number of tokens used in a prompt."""
   try:
     encoding = tiktoken.encoding_for_model(model)
@@ -141,6 +141,9 @@ class OpenAIChatCompletion(PromptInterface):
   @property
   def models(self) -> list[str]:
     return list(self.model_lookup.keys())
+  
+  def token_count(self, model: str, *text: str) -> int:
+    return count_tokens(self.model_lookup[model]["name"], *text)
 
   async def __aiter__(
     self,
@@ -157,7 +160,7 @@ class OpenAIChatCompletion(PromptInterface):
       } for msg in messages
     ]
     
-    total_tokens = await count_tokens(self.model_lookup[model]["name"], *[m['content'] for m in _msgs])
+    total_tokens = count_tokens(self.model_lookup[model]["name"], *[m['content'] for m in _msgs])
     if total_tokens <= self.model_lookup[model]['max_tokens'] // 2:
       pass
     elif total_tokens > self.model_lookup[model]['max_tokens'] // 2:

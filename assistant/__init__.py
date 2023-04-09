@@ -216,7 +216,12 @@ class PromptInterface(ABC):
   def models(self) -> list[str]:
     """Returns a tuple of the available LLM models"""
     ...
-  
+
+  @abstractmethod
+  def token_count(self, model: str, *text: str) -> int:
+    """Returns the number of tokens in the given text"""
+    ...
+
   @abstractmethod
   async def __aiter__(
     self,
