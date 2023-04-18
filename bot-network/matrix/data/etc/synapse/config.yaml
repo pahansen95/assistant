@@ -1,0 +1,72 @@
+# Configuration file for Synapse.
+#
+# This is a YAML file: see [1] for a quick introduction. Note in particular
+# that *indentation is important*: all the elements of a list or dictionary
+# should have the same indentation.
+#
+# [1] https://docs.ansible.com/ansible/latest/reference_appendices/YAMLSyntax.html
+#
+# For more information on how to configure Synapse, including a complete accounting of
+# each option, go to docs/usage/configuration/config_documentation.md or
+# https://matrix-org.github.io/synapse/latest/usage/configuration/config_documentation.html
+server_name: "assistant-dev"
+pid_file: /run/synapse.pid
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: true
+    resources:
+      - names: [client, federation]
+        compress: false
+database:
+  name: sqlite3
+  args:
+    database: /var/lib/synapse/sqlite3.db
+log_config: "/etc/synapse/log.yaml"
+media_store_path: /var/lib/synapse/media
+registration_shared_secret: "azH98hOsd1A+p^zR3*LF8KkBUquQTh5YaO_XBS1KJ0+vYvP*4X"
+report_stats: true
+macaroon_secret_key: "vI49V;r:zxwKZGFxG6~bP=w9njZ-F0usNW#Njj=cMG7~~^869L"
+form_secret: "X~MY4~-ZP4_=P+S.:G9cFGDFTf2mT&wkzXdw3Hzir0ntmxGoOp"
+signing_key_path: "/var/lib/synapse/signing.key"
+trusted_key_servers: []
+federation_domain_whitelist: []
+enable_registration: true
+enable_registration_without_verification: true
+password_config:
+  enabled: true
+  localdb_enabled: true
+  policy:
+    enabled: false
+
+# Minimize Rate Limiting
+rc_message: &rc_default
+  per_second: 1000
+  burst_count: 1000
+rc_registration: *rc_default
+rc_registration_token_validity: *rc_default
+rc_login:
+  address: *rc_default
+  account: *rc_default
+  failed_attempts: *rc_default
+rc_admin_redaction: *rc_default
+rc_joins:
+  local: *rc_default
+  remote: *rc_default
+rc_joins_per_room: *rc_default
+rc_3pid_validation: *rc_default
+rc_invites:
+  per_room: *rc_default
+  per_user: *rc_default
+  per_issuer: *rc_default
+rc_third_party_invite: *rc_default
+rc_federation:
+  window_size: 1
+  sleep_limit: 1
+  sleep_delay: 1
+  reject_limit: 5
+  concurrent: 5
+federation_rr_transactions_per_room_per_second: 5
+
+# vim:ft=yaml

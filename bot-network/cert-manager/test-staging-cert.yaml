@@ -1,0 +1,11 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: test-staging-certificate
+spec:
+  dnsNames: 
+   - "acme-staging-test.assistant-dev.peterhansen.io"
+  secretName: test-staging-tls-certificate
+  issuerRef:
+    name: "default-staging-certificate-issuer"
+    kind: ClusterIssuer

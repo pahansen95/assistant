@@ -38,7 +38,6 @@ class ChatTranscript(TranscriptProperties.PropsMixin, TranscriptProperties, Tran
     in_response_to: Iterable[ChatMessage] | ChatMessage | None = None,
   ) -> ChatMessage:
     """Records a message from an entity updating the conversational Graph. Returns the message."""
-    _logger.trace("Acquiring Transcript lock")
     # check to make sure that in_response_to doesn't have any unknown messages
     if in_response_to is None:
       in_response_to = []

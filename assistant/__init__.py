@@ -285,7 +285,7 @@ class EntityProperties(ABC):
   
   def __hash__(self) -> int:
     """A hash of the entity properties to use in things such as set operations."""
-    return hash(self.name, self.uuid.bytes)
+    return hash((self.name, self.uuid.bytes))
 
 
 class EntityInterface(ABC):
@@ -319,6 +319,10 @@ class ChatMessage:
   content: str
   entity: EntityProperties
   published: float
+
+  def __hash__(self) -> int:
+    """A hash of the chat message to use in things such as set operations."""
+    return hash((self.content, hash(self.entity), self.published))
 
 @properties_interface_factory(
   MetaProp(

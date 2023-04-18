@@ -1,0 +1,45 @@
+{
+  "default_server_config": {
+      "m.homeserver": {
+          "base_url": "https://assistant-dev.peter.vpn.assistant-dev.peterhansen.io/",
+          "server_name": "assistant-dev"
+      },
+      "m.identity_server": {
+          "base_url": ""
+      }
+  },
+  "disable_custom_urls": true,
+  "disable_guests": true,
+  "disable_login_language_selector": false,
+  "disable_3pid_login": true,
+  "brand": "assistant-dev",
+  "integrations_ui_url": "",
+  "integrations_rest_url": "",
+  "integrations_widgets_urls": [],
+  "bug_report_endpoint_url": "",
+  "uisi_autorageshake_app": "",
+  "default_country_code": "US",
+  "show_labs_settings": false,
+  "features": {},
+  "default_federate": false,
+  "default_theme": "dark",
+  "room_directory": {
+      "servers": []
+  },
+  "enable_presence_by_hs_url": {
+      "https://matrix.org": false,
+      "https://matrix-client.matrix.org": false
+  },
+  "setting_defaults": {
+      "breadcrumbs": true
+  },
+  "jitsi": {
+      "preferred_domain": ""
+  },
+  "element_call": {
+      "url": "",
+      "participant_limit": 0,
+      "brand": ""
+  },
+  "map_style_url": ""
+}

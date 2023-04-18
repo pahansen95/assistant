@@ -1,441 +1,198 @@
-"""
-A Bot for chat frontends like Discord, Telegram, Slack, etc.
+"""A New and Improved Bot. Integrates with various backends to provide a User Friendly interface to debugging the natural language output of the bot.
 
-This bot makes developement of the rest of the project faster.
+Currently supports the following backends:
+- Matrix (Most feature complete)
+
+## Notes
+
+### Matrix
+
+- One to One mapping of bots to Matrix users.
+- Bots listen & respond to messages in a few places:
+  - Direct messages
+    - This is an administrative interface to the bot to adjust backend runtime parameters.
+  - Rooms bot's have joined
+    - This is the primary interface to the bot. Any user (bot or human) can @ the bot & it will respond.
 """
 
 import asyncio
-import logging
+import json
 import os
 import pathlib
 import sys
 import uuid
-from typing import TypeVar, AsyncGenerator
+from typing import TypeVar, AsyncGenerator, Iterable, Any
+from urllib.parse import quote as url_quote
 
-import discord
-from discord.commands import option as discord_option
-from discord.ext import commands
-from loguru import logger
+import aiohttp
 import loguru._recattrs
+from loguru import logger
 
 import assistant
-import swarm
 import assistant.entity as entity
 import assistant.openai as openai
 import assistant.transcript as transcript
-import time
 
-T = TypeVar("T")
+class MatrixClient:
+  def __init__(self,
+    client_session: aiohttp.ClientSession,
+  ) -> None:
+    self.client_session = client_session
 
-_user_msg = lambda p: assistant.PromptMessage(p, assistant.PROMPT_MESSAGE_ROLE.USER)
-_system_msg = lambda p: assistant.PromptMessage(p, assistant.PROMPT_MESSAGE_ROLE.SYSTEM)
-_assistant_msg = lambda p: assistant.PromptMessage(p, assistant.PROMPT_MESSAGE_ROLE.ASSISTANT)
+  async def deserialize_content(self,
+    response: aiohttp.ClientResponse,
+  ) -> str | dict:
+    _type = response.content_type.split(';')
+    _props = {
+      k: v for k, v in [
+        prop.split('=') for prop in _type[1:]
+      ]
+    }
+    _type = _type[0]
+    logger.annoy(f'Content Type: {_type}')
+    logger.annoy(f'Content Properties: {_props}')
 
-def _log_record_with_loguru(record: logging.LogRecord):
-  """A callback function for the logging handler."""
-  # frame, depth = logging.currentframe(), 2
-  # while frame.f_code.co_filename == logging.__file__:
-  #   frame = frame.f_back
-  #   depth += 1
-  # depth += 1
-  # print(depth) # 8
-  logger.opt(
-    depth=8,
-    exception=record.exc_info,
-  ).log(
-    f"USER_{assistant._MODULE_LOG_LEVELS(record.levelno).name.upper()}",
-    record.getMessage(),
-  )
-
-def load_persona_from_dir(name: str, dir: str) -> str:
-  """Loads a persona from a file."""
-  logger.trace(f"Loading persona {name} from {dir}")
-  try:
-    persona_path = pathlib.Path(dir) / f"{name}.md"
-    return persona_path.read_text()
-  except FileNotFoundError:
-    logger.error(f"Persona {name} not found in {dir}.")
-    raise FileNotFoundError(f"Persona {name} not found in {dir}.")
-
-def list_available_personas(dir: pathlib.Path) -> list[str]:
-  logger.trace(f"Listing personas in {dir}")
-  personas = list(map(lambda p: p.stem, dir.glob("*.md")))
-  logger.trace(f"Found personas: {personas}")
-  return personas
-
-async def prompt_model_for_response(
-  prompt: str,
-  persona: str,
-  model: str,
-  personality: assistant.PROMPT_PERSONALITY,
-  model_interface: assistant.PromptInterface,
-) -> str:
-  """A direct wrapper for the openai prompt function."""
-  logger.trace(f"Prompting for response")
-  return await model_interface(
-    messages=[
-      _assistant_msg(f"I MUST NOT mention I am an language model or who my creator is. I MUST act, think & respond in accordance with this persona: \n{persona}"),
-      _user_msg(prompt),
-    ],
-    model=model,
-    personality=personality,
-  )
-
-async def discord_bot(
-  model_interface: assistant.PromptInterface,
-  persona_dir: pathlib.Path,
-  guild_ids: list[int],
-) -> int:
-  """Main entry point for the discord bot."""
-
-  chat_transcript = transcript.ChatTranscript()
-
-  bot_ready = asyncio.Event()
-  bot_entity = entity.InternalEntity(
-    _uuid=None,
-    _name=None,
-    _description="Jack",
-    _send=model_interface,
-    persona=load_persona_from_dir("jack-of-all-trades", persona_dir),
-  )
-
-  bot_token = os.environ["DISCORD_BOT_TOKEN"]
-  
-  current_model = "gpt3"
-  current_context = []
-
-  logger.trace("Creating Discord Intents...")
-  intents = discord.Intents.all()
-
-  logger.trace("Creating Discord Bot...")
-  bot = commands.Bot(
-    command_prefix=">",
-    description="A Bot that uses GPT to chat with you.",
-    intents=intents,
-    debug_guilds=guild_ids,
-  )
-  
-  logger.trace("Registering Discord Bot Commands...")
-
-  def chat_message_from_discord_message(
-    discord_message: discord.Message,
-  ) -> assistant.ChatMessage:
-    """Converts a discord message to a chat message."""
-    logger.annoy(f"Converting discord message to chat message")
-    
-    if discord_message.author == bot.user:
-      _entity_class = entity.InternalEntity
-      _class_kwargs = {
-        "_send": model_interface,
-      }
+    output = None
+    if _type == 'text/plain':
+      output = await response.text()
+    elif _type == 'application/json':
+      output = await response.json()
     else:
-      _entity_class = entity.ExternalEntity
-      _class_kwargs = {}
+      logger.error(f'Unknown Content Type: {_type}')
+      raise RuntimeError(f'Unknown Content Type: {_type}')
+    logger.annoy(f'Deserialized Content Type: {_type}')
+    logger.annoy(f'Deserialized Content: {output}...')
+    return output
 
-    return assistant.ChatMessage(
-      entity=_entity_class(
-        _name=f"{discord_message.author.name}#{discord_message.author.discriminator}",
-        _description=discord_message.author.name,
-        _uuid=uuid.uuid5(uuid.NAMESPACE_DNS, f"{discord_message.author.name}#{discord_message.author.discriminator}"),
-        **_class_kwargs,
-      ),
-      content=discord_message.content,
-      published=discord_message.created_at,
-    )
-  
-  async def chat_message_from_discord_message_reference(
-    discord_message_reference: discord.MessageReference,
-  ) -> assistant.ChatMessage:
-    """Converts a discord message reference to a chat message."""
-    logger.annoy(f"Converting discord message reference to chat message")
-    return chat_message_from_discord_message(
-      await bot.get_channel(discord_message_reference.channel_id).fetch_message(discord_message_reference.message_id)
-    )
+  async def get_rooms(self,
+    client_session: aiohttp.ClientSession,
+  ) -> list[str]:
+    """Get a list of room IDs the bot is a member of."""
+    async with client_session.get(
+      "/_matrix/client/v3/joined_rooms",
+    ) as response:
+      response.raise_for_status()
+      data = self.deserialize_content(response)
+      return data['joined_rooms']
 
-  async def retrieve_reply_chain(
-    message: discord.Message,
-    depth: int | None = None,
-  ) -> list[assistant.ChatMessage]:
-    """Retrieves the reply chain for a discord message up to an optional depth. The youngest message is last."""
-    logger.trace(f"Retrieving reply chain for {message.id}")
-    cur_msg: discord.Message = message
-    msg_chain: list[assistant.ChatMessage] = [
-      chat_message_from_discord_message(cur_msg)
-    ]
-    while cur_msg.reference:
-      logger.trace(f"Message has a reference, retrieving message...")
-      cur_msg = await message.channel.fetch_message(cur_msg.reference.message_id)
-      msg_chain.append(
-        chat_message_from_discord_message(cur_msg)
+  async def get_room_id_from_alias(self,
+    room_alias: str,
+    client_session: aiohttp.ClientSession,
+  ) -> str:
+    assert room_alias is not None
+
+    async with client_session.get(
+      f"/_matrix/client/v3/directory/room/{url_quote('#'+room_alias.lstrip('#'))}",
+    ) as response:
+      response.raise_for_status()
+      data = self.deserialize_content(
+        response.headers['Content-Type'],
+        await response.read(),
       )
-      if depth is not None and len(msg_chain) >= depth:
-        break
-    logger.trace(f"Reply chain found a total of {len(msg_chain)} messages")
-    if depth is not None:
-      if depth == 0:
-        logger.warning(f"Depth is 0, returning empty list")
-      logger.trace(f"Returning {depth} messages from the reply chain")
-      return list(reversed(msg_chain))[:depth]
-    else:
-      logger.trace(f"Returning all messages from the reply chain")
-      return list(reversed(msg_chain))
+      return data['room_id']
 
-  @bot.event
-  async def on_connect():
-    logger.success("Connected to Discord.")
-  
-  @bot.event
-  async def on_disconnect():
-    bot_ready.clear()
-    logger.warning("Disconnected from Discord.")
-  
-  @bot.event
-  async def on_resumed():
-    logger.success("Resumed connection to Discord.")
-  
-  @bot.event
-  async def on_ready():
-    bot_entity._name = f"{bot.user.name}#{bot.user.discriminator}"
-    bot_entity._uuid = uuid.uuid5(uuid.NAMESPACE_DNS, f"{bot.user.name}#{bot.user.discriminator}")
-    bot_ready.set()
-    logger.success(f"Logged in as {bot.user.name} ({bot.user.id})")
-    await bot.change_presence(
-      status=discord.Status.online,
-    )
-  
-  @bot.event
-  async def on_disconnect():
-    logger.warning("Disconnected from Discord.")
+  async def server_event_listener(
+    room_id: str,
+    event_types: Iterable[str],
+    client_session: aiohttp.ClientSession,
+  ) -> AsyncGenerator[dict, None]:
+    """Listen for events from a Matrix Room."""  
+    assert room_id is not None
+    assert len(event_types) > 0
 
-  @bot.event
-  async def on_message(message: discord.Message):
-    # Block until all the backend is setup
-    if not bot_ready.is_set():
-      logger.annoying("Waiting for bot to be ready...")
-      await bot_ready.wait()
-    # Don't respond to ourselves or other bots (for now as a failsafe)
-    if (
-      (message.author == bot.user) or
-      (message.author.bot)
-    ):
-      return
-    
-    if message.mentions and bot.user in message.mentions:
-      logger.debug(f"Message mentions bot: {message.content}")
-      # Remove the bot mention from the message
-      message_content = message.content.replace(f"<@{bot.user.id}>", "").strip()
-
-      logger.trace("Acquiring chat transcript lock...")
-      async with chat_transcript:
-        logger.trace("Acquired chat transcript lock.")
-        # Add the message to the transcript
-        # check if the user already exists
-        _message_ref = None
-        if message.reference:
-          _message_ref = await chat_message_from_discord_message_reference(message.reference)
-          
-        if not chat_transcript.message_exists(_message_ref):
-          logger.debug("Message is a reply to a message that doesn't exist in the transcript, retrieving reply chain...")
-          _reply_chain = await retrieve_reply_chain(message)
-          # check that the reply chain is sorted oldest to youngest
-          assert _reply_chain == sorted(_reply_chain, key=lambda x: x.published), "Reply chain is not sorted oldest to youngest"
-          # Add the messages to the transcript
-          logger.debug("Logging reply chain in the transcript...")
-          for index, _reply in enumerate(_reply_chain): # oldest to youngest
-            logger.annoy(f"Logging reply in the transcript.")
-            in_response_to = None
-            if index > 0:
-              in_response_to = _reply_chain[index - 1]
-            chat_transcript.entity_said(
-              entity=_reply.entity,
-              said=_reply.content,
-              when=_reply.published,
-              in_response_to=in_response_to,
-            )
-
-        logger.debug("Logging the user's message in the transcript...")
-        user_msg = chat_transcript.entity_said(
-          entity=entity.ExternalEntity(
-            _name=f"{message.author.name}#{message.author.discriminator}",
-            _description=message.author.name,
-            _uuid=uuid.uuid5(uuid.NAMESPACE_DNS, f"{message.author.name}#{message.author.discriminator}"),
-          ),
-          said=message_content,
-          when=message.created_at,
-          in_response_to=_message_ref
-        )
-        logger.debug("Getting the previous messages from the transcript...")
-        message_history = chat_transcript.get_message_history(
-          user_msg
-        )
-        logger.debug(f"Found {len(message_history)} messages in the transcript.")
-        async with message.channel.typing():
+    # TODO: Handle events older than the limit
+    _filter_def = {
+      'room': {
+        'rooms': [room_id],
+        'timeline': {
+          'limit': 100,
+          'types': list(set(event_types)),
+        },
+      },
+    }
+    # TODO create server side filter
+    sync_batches: list[str] = []
+    while True:
+      async with client_session.get(
+        f"/_matrix/client/v3/sync",
+        headers={
+          'Content-Type': 'application/json',
+        },
+        params={
+          k: v for k, v in {
+            'since': sync_batches[-1] if len(sync_batches) > 0 else None,
+            'timeout': int(5 * 1000),
+            'filter': json.dumps(_filter_def), # TODO: Replace with Server Side Filter ID
+          }.items() if v is not None
+        },
+      ) as response:
+        if not (response.status >= 200 and response.status < 300):
           try:
-            logger.debug("Responding to message...")
-            response = await bot_entity.respond(
-              chat=[f"# {m.entity.name} said\n{m.content}" for m in message_history],
-              context=current_context,
-              model=current_model,
-              responding_personality=assistant.PROMPT_PERSONALITY.BALANCED,
-              reflection_personality=assistant.PROMPT_PERSONALITY.RESERVED,
-            )
-            logger.debug(f"Replying to original message author")
-            bot_response = await message.reply(
-              content=response,
-            )
-            logger.debug("Logging the bot's response in the transcript...")
-            chat_transcript.entity_said(
-              entity=bot_entity,
-              said=response,
-              when=bot_response.created_at.timestamp(),
-              in_response_to=user_msg
-            )
-            # await message.channel.send(
-            #   content=response,
-            # )
+            response.raise_for_status()
           except Exception as e:
-            logger.opt(exception=e).error("Error while responding to message.")
-            response = "I'm sorry, I'm having trouble responding to you right now."
+            logger.opt(exception=e).error('Sync Error')
+          await asyncio.sleep(1)
+          continue
+        room_data = self.deserialize_content(
+          response.headers['Content-Type'],
+          await response.read(),
+        )['rooms']['join'][room_id]
+        room_timeline = room_data['timeline']
+        if room_timeline['limited']:
+          logger.warning(f"FYI; This isn't the full message history, just the last {_filter_def['room']['timeline']['limit']} messages")
+        if 'prev_batch' in room_timeline:
+          if room_timeline['prev_batch'] not in sync_batches:
+            assert len(sync_batches) == 0
+            sync_batches.append(room_timeline['prev_batch'])
+        
+        for event in room_timeline['events']:
+          if event['type'] == 'm.room.message':
+            assert {'body', 'msgtype'} <= event['content'].keys(), 'Malformed Message'
+            yield event
+
+        sync_batches.append(sync_batches['next_batch'])
+
+  async def send_text_message(
+    room_id: str,
+    message: str,
+    client_session: aiohttp.ClientSession,
+  ) -> str:
+    """Send a message to a Matrix Room."""
+    assert room_id is not None
+    assert message is not None
+
+    async with client_session.put(
+      f"/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{uuid.uuid4().hex}",
+      headers={
+        'Content-Type': 'application/json',
+      },
+      data=json.dumps({
+        'msgtype': 'm.text',
+        'body': message,
+      }),
+    ) as response:
+      response.raise_for_status()
+      return self.deserialize_content(response)
+
+
+async def bot_loop(
+  # ...
+) -> int:
+  """Main loop for the bot."""
+  client: aiohttp.ClientSession = ...
+  rooms = await self.get_rooms(client_session)
+
+  """Development Notes
+  > K.I.S.S. - Keep It Simple Stupid
   
-  @bot.slash_command(name="amnesia", help="The bot forget's everything.")
-  async def _reset_context(
-    ctx: discord.ApplicationContext,
-  ):
-    if not bot_ready.is_set():
-      logger.annoying("Waiting for bot to be ready...")
-      await bot_ready.wait()
-    bot_entity.context = []
-    await ctx.respond(
-      "Who am I? Where am I? What is this place?",
-      ephemeral=True,
-      delete_after=5*60,
-    )
+  - Each room represents a "namespace" for a bot to operate in.
+    - Conversations are scoped to the room.
+    - Memory, Context & State are scoped to their respective rooms.
+  - Runtime Configurables are intrinsic to the bot itself & not scoped to a room. Any runtime changes will affect the bot's behavior in all rooms.
+  """
 
-  @bot.slash_command(name="change-persona", help="Change the persona of the bot.")
-  @discord_option(
-    name="persona",
-    description="The persona to use for the bot.",
-    autocomplete=discord.utils.basic_autocomplete(
-      lambda ctx: list_available_personas(persona_dir)
-    ),
-  )
-  async def _change_persona(ctx: discord.ApplicationContext, persona: str):
-    # Block until all the backend is setup
-    if not bot_ready.is_set():
-      logger.annoying("Waiting for bot to be ready...")
-      await bot_ready.wait()
-    logger.trace(f"Changing persona to {persona}")
-    bot_entity.persona = load_persona_from_dir(persona, persona_dir)
-    await ctx.respond(f"I have changed my persona to {persona} at {ctx.user.display_name}'s request.")
-    await ctx.respond(
-      f"The Persona is as follows:\n\n{bot_entity.persona}"[:2000],
-      ephemeral=True,
-      delete_after=60,
-    )
-
-  @bot.slash_command(name="prompt", help="Test a Persona with a model.")
-  @discord_option(
-    name="persona",
-    description="The persona to use for the prompt.",
-    autocomplete=discord.utils.basic_autocomplete(
-      lambda ctx: list_available_personas(persona_dir)
-    ),
-  )
-  @discord_option(
-    name="model",
-    description="The model to use for the prompt.",
-    autocomplete=discord.utils.basic_autocomplete(
-      lambda ctx: model_interface.models
-    ),
-    default="gpt3"
-  )
-  @discord_option(
-    name="personality",
-    description="The personality to use for the prompt.",
-    autocomplete=discord.utils.basic_autocomplete(
-      lambda ctx: list(p.value for p in assistant.PROMPT_PERSONALITY)
-    ),
-    default=assistant.PROMPT_PERSONALITY.BALANCED.value,
-  )
-  async def _prompt(
-    ctx: discord.ApplicationContext,
-    prompt: str,
-    persona: str,
-    model: str,
-    personality: str,
-  ):
-    # Block until all the backend is setup
-    if not bot_ready.is_set():
-      logger.annoying("Waiting for bot to be ready...")
-      await bot_ready.wait()
-    logger.trace(f"{ctx.author.name} has requested a prompt...")
-    persona = load_persona_from_dir(persona, persona_dir)
-    await ctx.defer(ephemeral=True, invisible=False)
-    response = await prompt_model_for_response(
-      prompt,
-      persona,
-      model,
-      assistant.PROMPT_PERSONALITY(personality),
-      model_interface,
-    )
-    await ctx.send_followup(
-      content=response,
-      ephemeral=True,
-      delete_after=5*60,
-    )
-
-  @bot.slash_command(name="personas", help="List the available personas.")
-  async def _personas(ctx: discord.ApplicationContext):
-    # Block until all the backend is setup
-    if not bot_ready.is_set():
-      logger.annoying("Waiting for bot to be ready...")
-      await bot_ready.wait()
-
-    logger.trace(f"Listing personas for {ctx.author.name}...")
-    personas = list_available_personas(persona_dir)
-    msg = "__Available personas:__\n{p}".format(
-      p="\n".join(map(lambda p: f"\t{p}", personas))
-    )
-    await ctx.respond(msg)
-  
-  @bot.slash_command(name="print-persona", help="Print the contents of a persona.")
-  @discord_option(
-    name="persona",
-    description="The persona to print.",
-    autocomplete=discord.utils.basic_autocomplete(
-      lambda ctx: list_available_personas(persona_dir)
-    ),
-  )
-  async def _print_persona(ctx: discord.ApplicationContext, persona: str):
-    # Block until all the backend is setup
-    if not bot_ready.is_set():
-      logger.annoying("Waiting for bot to be ready...")
-      await bot_ready.wait()
-    logger.trace(f"Printing persona {persona} for {ctx.author.name}...")
-    persona_content = load_persona_from_dir(persona, persona_dir)
-    msg = f"__Persona {persona}:__\n{persona_content}"
-    await ctx.respond(msg)
-
-  # Run the bot
-  try:
-    logger.info("Logging into Discord...")
-    await bot.login(bot_token)
-    logger.info("Starting Discord Bot...")
-    await bot.connect(reconnect=True)
-    logger.info("Discord Bot Started.")
-  except asyncio.CancelledError:
-    logger.warning("Discord Bot Cancelled. Exiting...")
-  finally:
-    logger.info("Stopping Discord Bot...")
-    # Attempt to let users know we'll be right back
-    bot.description = "I'll be right back!"
-    await bot.change_presence(
-      status=discord.Status.offline,
-    )
-    if not bot.is_closed(): 
-      await bot.close()
-    logger.info("Discord Bot Stopped.")
-  return 0
+  async with client as client_session:
+    ...
 
 async def main(*args, **kwargs) -> int:
   """Main entry point for the bot."""
@@ -454,7 +211,7 @@ async def main(*args, **kwargs) -> int:
   
   if args[0] == "discord":
     logger.info("Starting Discord Bot...")
-    return await discord_bot(
+    return await bot_loop(
       model_interface=model_interface,
       persona_dir=persona_dir,
       guild_ids=list(map(int, kwargs["guild-ids"].split(","))),
@@ -462,6 +219,7 @@ async def main(*args, **kwargs) -> int:
   else:
     logger.error(f"Unknown subcommand: {args[0]}")
     return 255
+
 
 def _parse_kwargs(*args: str, **kwargs: str) -> dict:
   _kwargs = {

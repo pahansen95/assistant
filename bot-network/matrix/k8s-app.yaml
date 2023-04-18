@@ -1,0 +1,163 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: matrix
+  labels:
+    app: matrix
+spec:
+  selector:
+    matchLabels:
+      app: matrix
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: matrix
+    spec:
+      shareProcessNamespace: true
+      containers:
+        - name: matrix-api
+          image: ghcr.io/matrix-org/synapse:v1.81.0
+          imagePullPolicy: IfNotPresent
+          command: [/start.py]
+          args: [run]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          env:
+            - name: SYNAPSE_CONFIG_DIR
+              value: /etc/synapse
+            - name: SYNAPSE_CONFIG_PATH
+              value: /etc/synapse/config.yaml
+            - name: TZ
+              value: UTC
+            - name: UID
+              value: "0"
+            - name: GID
+              value: "0"
+          ports:
+            - name: matrix-api
+              containerPort: 8008
+              protocol: TCP
+            - name: matrix-idk
+              containerPort: 8009
+              protocol: TCP
+            - name: matrix-fed
+              containerPort: 8448
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: matrix-api
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          livenessProbe:
+              httpGet:
+                path: /health
+                port: matrix-api
+              initialDelaySeconds: 10
+              periodSeconds: 10
+          volumeMounts:
+            - name: matrix-data
+              mountPath: /etc/synapse
+              subPath: etc/synapse
+            - name: matrix-data
+              mountPath: /var/lib/synapse
+              subPath: var/lib/synapse
+        - name: matrix-ui
+          image: docker.io/vectorim/element-web:v1.11.29
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: matrix-ui
+              containerPort: 8081
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+                path: /
+                port: matrix-ui
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          livenessProbe:
+              httpGet:
+                  path: /
+                  port: matrix-ui
+              initialDelaySeconds: 10
+              periodSeconds: 10
+          volumeMounts:
+            - name: matrix-data
+              mountPath: /app/config.json
+              subPath: etc/element-io/config.json
+            - name: matrix-data
+              mountPath: /etc/nginx/conf.d
+              subPath: etc/nginx/conf.d
+      volumes:
+        - name: matrix-data
+          hostPath:
+            path: /home/peter/matrix/data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: matrix
+  labels:
+    app: matrix
+spec:
+  selector:
+    app: matrix
+  ports:
+    - name: matrix-ui
+      port: 80
+      targetPort: matrix-ui
+    - name: matrix-api
+      port: 8008
+      targetPort: matrix-api
+    - name: matrix-idk
+      port: 8009
+      targetPort: matrix-idk
+    - name: matrix-fed
+      port: 8448
+      targetPort: matrix-fed
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: matrix-certificate
+  labels:
+    app: matrix
+spec:
+  dnsNames: 
+   - "assistant-dev.peterhansen.io"
+   - "ui.assistant-dev.peterhansen.io"
+   - "api.assistant-dev.peterhansen.io"
+   - "assistant-dev.peter.vpn.assistant-dev.peterhansen.io"
+  secretName: matrix-tls-certificate
+  issuerRef:
+    name: "default-certificate-issuer"
+    kind: ClusterIssuer
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: matrix-ingress-https
+  labels:
+    app: matrix
+spec:
+  entryPoints:
+    - websecure
+  tls:
+    secretName: matrix-tls-certificate
+  routes:
+    # The UI
+    - match: Host(`assistant-dev.peterhansen.io`) || Host(`ui.assistant-dev.peterhansen.io`)
+      kind: Rule
+      services:
+        - name: matrix
+          port: matrix-ui
+    # The API
+    - match: Host(`assistant-dev.peter.vpn.assistant-dev.peterhansen.io`) || Host(`api.assistant-dev.peterhansen.io`)
+      kind: Rule
+      services:
+        - name: matrix
+          port: matrix-api
+

@@ -50,7 +50,7 @@ class InternalEntity(EntityProperties.PropsMixin, EntityProperties, EntityInterf
     _logger.debug(f"{self.uuid=}")
 
   def __hash__(self) -> int:
-    return hash((self.uuid.hex, self.name))
+    return EntityProperties.__hash__(self)
     
   def render_iterable(self, header: str, iterable: Iterable[str]) -> str:
     """Convience function for rendering an iterable into a single string"""
@@ -134,25 +134,55 @@ class InternalEntity(EntityProperties.PropsMixin, EntityProperties, EntityInterf
     assert all(isinstance(msg, str) for msg in chat), "Chat must be a list of strings"
     assert isinstance(context, list), "Context must be a list"
     assert all(isinstance(msg, str) for msg in context), "Context must be a list of strings"
-    rendered_prompt = self.render_prompt(
+    rendered_prompt = lambda: self.render_prompt(
       chat=chat,
       context=context,
     )
     _logger.debug(f"Entity {self.name} has been asked to respond to the following chat\n{chat[-1]}")
     _logger.trace("Entity {self.name}: render_prompt()\n{prompt}".format(
       self=self,
-      prompt='\n'.join(rp.content for rp in rendered_prompt),
+      prompt='\n'.join(rp.content for rp in rendered_prompt()),
     ))    
     
-    # Think
+    ### Think it through before answering
+    entity_thoughts = await self._send(
+      messages=[
+        *rendered_prompt(),
+        _user_msg("\n".join([
+          "# Don't respond to the chat instead you need to first think through your response and then summarize your thoughts."
+          "## You need to think through the following..."
+          "- What is the intent of the user's last message?",
+          "- How does the user want you to respond?",
+          "- Do you have the necessary information to respond?",
+          "- Do you need to ask the user for more information?",
+          # "- How would a human respond to this situation?",
+          "## What should you do with these thoughts?",
+          "- you should generate a salient summary of your thoughts as an itemized list",
+          "- For each item you should describe your thought process",
+          "- For each item you should point out any assumptions you made",
+        ])),
+      ],
+      model=model,
+      personality=reflection_personality,
+    )
+    _logger.debug(f"Entity {self.name} thoughts on the conversation\n{entity_thoughts}")
+    _logger.trace("Storing Entity thoughts in short term memory")
+    self.context.append(entity_thoughts)
     
     # Entity will come up with a response
     initial_response = await self._send(
-      messages=rendered_prompt,
+      messages=[
+        *rendered_prompt(),
+        _user_msg("\n".join([
+          "> Respond directly to the last message in the chat history. Don't explicitly state relevant information, immediate observations or your persona unless it makes sense in the context of the user's last message."
+        ])),
+      ],
       model=model,
       personality=responding_personality,
     )
     _logger.debug(f"Entity {self.name} initial response\n{initial_response}")
+    _logger.trace("Removing Entity thoughts from short term memory")
+    self.context.pop()
     return initial_response
 
     # Let the entity think about it's response

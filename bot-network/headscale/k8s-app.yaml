@@ -1,0 +1,229 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: overlay-vpn-sa
+  labels:
+    app: headscale
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: overlay-vpn-role
+  labels:
+    app: headscale
+rules:
+  - apiGroups: [""]
+    resourceNames: ["overlay-vpn-auth"]
+    resources: ["secrets"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: overlay-vpn-rolebinding
+  labels:
+    app: headscale
+subjects:
+  - kind: ServiceAccount
+    name: overlay-vpn-sa
+roleRef:
+  kind: Role
+  name: overlay-vpn-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: overlay-vpn-config
+  labels:
+    app: headscale
+data:
+  TS_KUBE_SECRET: overlay-vpn-auth
+  TS_USERSPACE: "false"
+  TS_EXTRA_ARGS: |
+    --accept-risk=all
+    --accept-routes
+    --login-server https://vpn.assistant-dev.peterhansen.io
+    --reset --force-reauth
+    --timeout 15s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headscale
+  labels:
+    app: headscale
+spec:
+  selector:
+    matchLabels:
+      app: headscale
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: headscale
+    spec:
+      serviceAccountName: overlay-vpn-sa
+      shareProcessNamespace: true
+      # initContainers:
+      #   # Enable IP forwarding for the overlay VPN
+      #   - name: sysctler
+      #     image: busybox
+      #     securityContext:
+      #       privileged: true
+      #     command: ["/bin/sh"]
+      #     args:
+      #       - -c
+      #       - sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
+      #     resources:
+      #       requests:
+      #         cpu: 1m
+      #         memory: 1Mi
+      containers:
+        - name: headscale-mgmt-server
+          image: localhost/headscale-app:v0.21.0_2023.01.30-beta-1
+          imagePullPolicy: Never
+          command: [/usr/local/bin/headscale]
+          args: [serve]
+          ports:
+            - name: http-api
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+            - name: grpc
+              containerPort: 50443
+              protocol: TCP
+          volumeMounts:
+            - name: headscale-data
+              mountPath: /etc/headscale
+              subPath: etc/headscale
+            - name: headscale-data
+              mountPath: /var/lib/headscale
+              subPath: var/lib/headscale
+        - name: headscale-ui
+          image: localhost/headscale-app:v0.21.0_2023.01.30-beta-1
+          imagePullPolicy: Never
+          command: [ "/usr/local/bin/static-web-server" ]
+          args: [ "--port", "8081", "--root", "/var/www/", "--log-level", "info" ]
+          ports:
+            - name: http-ui
+              containerPort: 8081
+              protocol: TCP
+        # This Tailscale Sidecar is the bot (overlay) network's gateway to this instance.
+        # - name: overlay-vpn
+        #   image: ghcr.io/tailscale/tailscale:stable
+        #   imagePullPolicy: IfNotPresent
+        #   env:
+        #     - name: TS_KUBE_SECRET
+        #       valueFrom:
+        #         configMapKeyRef:
+        #           name: overlay-vpn-config
+        #           key: TS_KUBE_SECRET
+        #     - name: TS_USERSPACE
+        #       valueFrom:
+        #         configMapKeyRef:
+        #           name: overlay-vpn-config
+        #           key: TS_USERSPACE
+        #     - name: TS_AUTHKEY
+        #       valueFrom:
+        #         secretKeyRef:
+        #           name: overlay-vpn-auth
+        #           key: TS_AUTHKEY
+        #           optional: false
+        #     - name: TS_EXTRA_ARGS
+        #       valueFrom:
+        #         configMapKeyRef:
+        #           name: overlay-vpn-config
+        #           key: TS_EXTRA_ARGS
+        #     - name: TS_HOSTNAME
+        #       # NOTE: This needs to match the `.["default_server_config"]["m.homeserver"]["base_url"]` property in ../matrix/data/etc/element-io/config.json
+        #       #       This needs to match the `.spec.routes[N].match` property of the `IngressRoute.traefik.containo.us/v1alpha1` resource in ../matrix/k8s-app.yaml
+        #       value: "assistant-dev"
+        #     - name: TS_DEST_IP
+        #       # NOTE: This emulates going over the internet by forwarding traffic to the Host's IP address. After this traffic will be handled by Kubernetes as normal.
+        #       valueFrom:
+        #         fieldRef:
+        #           fieldPath: status.hostIP
+        #   securityContext:
+        #     capabilities:
+        #       add:
+        #       - NET_ADMIN
+      volumes:
+        - name: headscale-data
+          hostPath:
+            path: /home/peter/headscale/data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: headscale
+spec:
+  selector:
+    app: headscale
+  ports:
+    - name: http-api
+      port: 8080
+      targetPort: http-api
+    - name: http-ui
+      port: 8081
+      targetPort: http-ui
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+    - name: grpc
+      port: 50443
+      targetPort: grpc
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: headscale-certificate
+spec:
+  dnsNames: 
+   - "vpn.assistant-dev.peterhansen.io"
+  secretName: headscale-tls-certificate
+  issuerRef:
+    name: "default-certificate-issuer"
+    kind: ClusterIssuer
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: headscale-rewrite-web
+spec:
+  replacePathRegex:
+    regex: "^/$"
+    replacement: "/web"
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: headscale-ingress
+spec:
+  entryPoints:
+    - websecure
+  tls:
+    secretName: headscale-tls-certificate
+  routes:
+    # Match Web Traffic
+    - match: Host(`vpn.assistant-dev.peterhansen.io`) && (PathPrefix(`/web`) || Path(`/`))
+      kind: Rule
+      services:
+        - name: headscale
+          port: http-ui
+      middlewares:
+        - name: headscale-rewrite-web
+    # Match Metrics Traffic
+    - match: Host(`vpn.assistant-dev.peterhansen.io`) && PathPrefix(`/metrics`)
+      kind: Rule
+      services:
+        - name: headscale
+          port: metrics
+    - match: Host(`vpn.assistant-dev.peterhansen.io`)
+      kind: Rule
+      services:
+        - name: headscale
+          port: http-api
