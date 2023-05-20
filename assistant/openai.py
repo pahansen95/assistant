@@ -10,7 +10,34 @@ OPENAI_MODEL_LOOKUP = {
   "gpt3": {
     "name": "gpt-3.5-turbo",
     "max_tokens": 4096,
-    "supported_modes": ["render", "response"],
+    "personality": {
+      "creative": {
+        "description": "Responses are more creative; the model is more curious.",
+        "tuning": {
+          "temperature": 2.0,
+          # "top_p": 0.76, # Wasn't creative enough
+          "top_p": 0.95, # Warning! I have observed the model gets "stuck" & never generates a response
+        }
+      },
+      "balanced": {
+        "description": "Responses are more balanced; the model is more balanced.",
+        "tuning": {
+          "temperature": 1.0,
+          "top_p": 0.815,
+        }
+      },
+      "reserved": {
+        "description": "Responses are more reserved; the model is more straightforward.",
+        "tuning": {
+          "temperature": 0.5,
+          "top_p": 0.68,
+        }
+      },
+    }
+  },
+  "gpt4": {
+    "name": "gpt-4",
+    "max_tokens": 8192,
     "personality": {
       "creative": {
         "description": "Responses are more creative; the model is more curious.",

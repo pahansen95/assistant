@@ -5,22 +5,26 @@ description = "A Smart Assistant for Ideation"
 authors = ["Peter <mail@peterhansen.io>"]
 license = "MIT"
 readme = "README.md"
+packages = [
+  {include = "assistant", from = "lib"},
+  {include = "conversation", from = "lib"},
+]
+
 
 [tool.poetry.dependencies]
-python = "^3.10"
-openai = "^0.27.2"
-tiktoken = "^0.3.3"
+python = ">=3.10,<3.11"
 aiofiles = "^23.1.0"
 loguru = "^0.6.0"
-langchain = "^0.0.128"
 aiohttp = "^3.8.4"
 pyzmq = "^25.0.2"
 uri = "^2.0.1"
-
+networkx = "^3.1"
+aioreactive = "^0.16.0"
+openai = "^0.27.7"
+tiktoken = "^0.4.0"
 
 [tool.poetry.group.meta.dependencies]
 jinja2 = "^3.1.2"
-networkx = "^3.1"
 py-cord = "^2.4.1"
 
 [build-system]
