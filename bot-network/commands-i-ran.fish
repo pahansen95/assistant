@@ -1,3 +1,4 @@
+#!/usr/bin/env fish
 echo "Don't run me. Demonstration Purposes only." >&2
 exit 1
 
@@ -37,3 +38,27 @@ podman run --rm -it \
   --mount "type=bind,source=$PWD,destination=/data" \
   ghcr.io/matrix-org/synapse:v1.81.0 \
     generate
+
+# Synapse Admin Tool
+alias --save matrix-cli 'kubectl exec -it deployments/matrix -c=matrix-api -- bash'
+
+# Bootstrap the Matrix Environment
+matrix-cli
+# The rest of these commands are run inside the container
+
+register_new_matrix_user \
+  --user=admin \
+  --admin \
+  --config=/etc/synapse/config.yaml
+
+register_new_matrix_user \
+  --user=peter \
+  --no-admin \
+  --config=/etc/synapse/config.yaml \
+
+register_new_matrix_user \
+  --user=assistant \
+  --no-admin \
+  --config=/etc/synapse/config.yaml
+
+# Exit the container
