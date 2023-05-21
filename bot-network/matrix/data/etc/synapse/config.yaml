@@ -25,10 +25,10 @@ database:
     database: /var/lib/synapse/sqlite3.db
 log_config: "/etc/synapse/log.yaml"
 media_store_path: /var/lib/synapse/media
-registration_shared_secret: "azH98hOsd1A+p^zR3*LF8KkBUquQTh5YaO_XBS1KJ0+vYvP*4X"
+registration_shared_secret: "" # Update me with a secret key. ex. azH98hOsd1A+p^zR3*LF8KkBUquQTh5YaO_XBS1KJ0+vYvP*4X
 report_stats: true
-macaroon_secret_key: "vI49V;r:zxwKZGFxG6~bP=w9njZ-F0usNW#Njj=cMG7~~^869L"
-form_secret: "X~MY4~-ZP4_=P+S.:G9cFGDFTf2mT&wkzXdw3Hzir0ntmxGoOp"
+# macaroon_secret_key: # Will use the registration_shared_secret
+form_secret: "" # Update me w/ a secret key. ex. X~MY4~-ZP4_=P+S.:G9cFGDFTf2mT&wkzXdw3Hzir0ntmxGoOp
 signing_key_path: "/var/lib/synapse/signing.key"
 trusted_key_servers: []
 federation_domain_whitelist: []
